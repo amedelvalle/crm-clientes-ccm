@@ -3,6 +3,7 @@ import { supabase } from './lib/supabase'
 import Papa from 'papaparse'
 import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
+import logoCcm from './assets/logo-ccm.png'
 
 function clean(v) {
   return String(v ?? '').trim()
@@ -333,9 +334,14 @@ export default function App() {
   return (
     <main className="app">
       <header>
-        <div>
-          <h1>CRM Clientes CCM</h1>
-          <p>Carga, scoring y seguimiento comercial</p>
+        <div className="brand">
+          <div className="brand-logo">
+            <img src={logoCcm} alt="CCM" />
+          </div>
+          <div>
+            <h1>CRM Clientes CCM</h1>
+            <p>Carga, scoring y seguimiento comercial</p>
+          </div>
         </div>
         <button className="secondary" onClick={() => supabase.auth.signOut()}>Salir</button>
       </header>
