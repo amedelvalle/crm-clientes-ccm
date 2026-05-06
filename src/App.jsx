@@ -5,73 +5,132 @@ import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import logoCcm from './assets/logo-ccm.png'
 
-const CLIENT_COLUMNS = ['expediente', 'nombre', 'telefono', 'celular', 'tipo_cliente']
 const CLIENT_BATCH_SIZE = 500
 const TX_BATCH_SIZE = 250
+const PAGE_SIZE = 25
+const EXCLUDED_EXPEDIENTES = new Set(['3864'])
+
+const DEFAULT_FILTERS = {
+  search: '',
+  tipoCliente: 'PRIVADO',
+  estado: 'todos',
+  clasificacion: 'todos',
+  anioComparativo: '',
+  tipoClienteComparativo: 'PRIVADO'
+}
+
+const TABS = [
+  { key: 'dashboard', label: 'Dashboard' },
+  { key: 'clientes', label: 'Clientes' },
+  { key: 'comparativo', label: 'Comparativo anual' },
+  { key: 'exportar', label: 'Exportar' },
+  { key: 'carga', label: 'Carga' },
+  { key: 'historial', label: 'Historial' },
+  { key: 'logica', label: 'Lógica del reporte' }
+]
+
+const RELATION_ORDER = {
+  nuevo_reciente: 1,
+  nuevo_en_seguimiento: 2,
+  nuevo_sin_recompra: 3,
+  activo: 4,
+  vigilancia: 5,
+  en_riesgo: 6,
+  inactivo_reciente: 7,
+  inactivo_prolongado: 8,
+  recuperado: 9,
+  inactivo_forzado: 10
+}
+
+const STRATEGY_ORDER = {
+  bronce: 1,
+  plata: 2,
+  oro: 3,
+  diamante: 4
+}
 
 function clean(value) {
-  return String(value ?? '').trim()
+  if (value === null || value === undefined) return ''
+  return String(value).trim()
 }
 
-function normalizeKey(value) {
+function normalizeHeader(value) {
   return clean(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[.\-\/]/g, ' ')
-    .replace(/\s+/g, '_')
-}
-
-function normalizeText(value) {
-  return clean(value)
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toUpperCase()
-}
-
-function isRowEmpty(row) {
-  if (!row || typeof row !== 'object') return true
-  return Object.values(row).every(value => clean(value) === '')
+    .replace(/\s+/g, ' ')
 }
 
 function getValue(row, candidates) {
-  const normalized = {}
-
-  Object.entries(row || {}).forEach(([key, value]) => {
-    normalized[normalizeKey(key)] = value
-  })
-
+  const keys = Object.keys(row || {})
   for (const candidate of candidates) {
-    const key = normalizeKey(candidate)
-    if (Object.prototype.hasOwnProperty.call(normalized, key)) {
-      return normalized[key]
-    }
+    const normalizedCandidate = normalizeHeader(candidate)
+    const found = keys.find(key => normalizeHeader(key) === normalizedCandidate)
+    if (found !== undefined) return row[found]
   }
-
   return ''
 }
 
-function normalizeTipoCliente(value) {
-  const raw = normalizeText(value)
-
-  if (!raw) return 'SIN CLASIFICAR'
-  if (raw.includes('PRIVADO')) return 'PRIVADO'
-  if (raw.includes('NO COBRO') || raw.includes('NO_COBRO')) return 'NO COBRO'
-  if (raw.includes('INSTITUCIONAL')) return 'INSTITUCIONAL'
-  if (raw.includes('EXTERNO')) return 'EXTERNO'
-  if (raw.includes('MEDICO') || raw.includes('MÉDICO')) return 'MEDICO'
-  if (raw.includes('OTROS') || raw.includes('OTRO')) return 'OTROS'
-
-  return raw
+function isEmptyRow(row) {
+  return Object.values(row || {}).every(value => clean(value) === '')
 }
 
-function parseDate(value) {
+function isExcludedExpediente(value) {
+  return EXCLUDED_EXPEDIENTES.has(clean(value))
+}
+
+function normalizeTipoCliente(value) {
+  const raw = normalizeHeader(value)
+  if (!raw) return 'SIN CLASIFICAR'
+  if (raw.includes('privado')) return 'PRIVADO'
+  if (raw.includes('no cobro') || raw.includes('nocobro')) return 'NO COBRO'
+  if (raw.includes('institucional')) return 'INSTITUCIONAL'
+  if (raw.includes('externo')) return 'EXTERNO'
+  if (raw.includes('medico') || raw.includes('medico')) return 'MEDICO'
+  if (raw.includes('otros') || raw.includes('otro')) return 'OTROS'
+  return clean(value).toUpperCase()
+}
+
+function normalizeMoney(value) {
   if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+
+  let raw = String(value).trim()
+  if (!raw) return null
+
+  raw = raw
+    .replace(/\$/g, '')
+    .replace(/\s/g, '')
+    .replace(/[^\d,.-]/g, '')
+
+  const hasComma = raw.includes(',')
+  const hasDot = raw.includes('.')
+
+  if (hasComma && hasDot) {
+    raw = raw.replace(/,/g, '')
+  } else if (hasComma && !hasDot) {
+    raw = raw.replace(',', '.')
+  }
+
+  const number = Number(raw)
+  return Number.isFinite(number) ? number : null
+}
+
+function parseDateValue(value) {
+  if (!value) return null
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10)
+  }
 
   if (typeof value === 'number') {
     const date = XLSX.SSF.parse_date_code(value)
     if (!date) return null
-    return `${date.y}-${String(date.m).padStart(2, '0')}-${String(date.d).padStart(2, '0')}`
+    const yyyy = String(date.y).padStart(4, '0')
+    const mm = String(date.m).padStart(2, '0')
+    const dd = String(date.d).padStart(2, '0')
+    return `${yyyy}-${mm}-${dd}`
   }
 
   const raw = clean(value)
@@ -80,76 +139,126 @@ function parseDate(value) {
   const iso = raw.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/)
   if (iso) {
     const [, y, m, d] = iso
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`
+    return `${y.padStart(4, '0')}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`
   }
 
-  const latin = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/)
-  if (latin) {
-    let [, d, m, y] = latin
+  const local = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/)
+  if (local) {
+    let [, d, m, y] = local
     if (y.length === 2) y = `20${y}`
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`
+    return `${y.padStart(4, '0')}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`
   }
 
   const parsed = new Date(raw)
-  if (Number.isNaN(parsed.getTime())) return null
-  return parsed.toISOString().slice(0, 10)
-}
-
-function parseMoney(value) {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : 0
-
-  let raw = clean(value)
-  if (!raw) return 0
-
-  raw = raw.replace(/[^\d,.-]/g, '')
-
-  const hasComma = raw.includes(',')
-  const hasDot = raw.includes('.')
-
-  if (hasComma && hasDot) {
-    const lastComma = raw.lastIndexOf(',')
-    const lastDot = raw.lastIndexOf('.')
-    if (lastComma > lastDot) {
-      raw = raw.replace(/\./g, '').replace(',', '.')
-    } else {
-      raw = raw.replace(/,/g, '')
-    }
-  } else if (hasComma && !hasDot) {
-    raw = raw.replace(',', '.')
-  }
-
-  const parsed = Number(raw)
-  return Number.isFinite(parsed) ? parsed : 0
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10)
+  return null
 }
 
 function isAnulada(value) {
-  const raw = normalizeText(value)
-  return ['SI', 'S', 'TRUE', 'VERDADERO', 'ANULADA', 'ANULADO', '1', 'YES'].includes(raw)
+  const raw = normalizeHeader(value)
+  return ['si', 's', 'true', '1', 'anulada', 'anulado', 'yes', 'y'].includes(raw)
 }
 
-function isTotalizationRow(row) {
-  const values = Object.values(row || {}).map(normalizeText).join(' ')
-  return values.includes('TOTAL GENERAL') || values === 'TOTAL' || values.includes('TOTALIZACION')
+function slug(value) {
+  return clean(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/_/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
 }
 
-function chunk(array, size) {
+function humanLabel(value) {
+  if (!value) return 'Sin dato'
+  return clean(value)
+    .replaceAll('_', ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, letter => letter.toUpperCase())
+}
+
+function formatNumber(value) {
+  return new Intl.NumberFormat('es-SV').format(Number(value || 0))
+}
+
+function formatMoney(value) {
+  return new Intl.NumberFormat('es-SV', {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits: 2
+  }).format(Number(value || 0))
+}
+
+function formatDate(value) {
+  if (!value) return '—'
+  const date = new Date(`${String(value).slice(0, 10)}T12:00:00`)
+  if (Number.isNaN(date.getTime())) return '—'
+  return new Intl.DateTimeFormat('es-SV', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  }).format(date)
+}
+
+function formatDateTime(value) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  return new Intl.DateTimeFormat('es-SV', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).format(date)
+}
+
+function percent(value, total) {
+  if (!total) return '0.0%'
+  return `${((Number(value || 0) / total) * 100).toFixed(1)}%`
+}
+
+function chunk(items, size) {
   const chunks = []
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size))
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size))
   }
   return chunks
 }
 
-async function readFile(file) {
+function toCsv(rows) {
+  if (!rows.length) return ''
+  const columns = Object.keys(rows[0])
+  const escape = value => `"${String(value ?? '').replaceAll('"', '""')}"`
+  return [
+    columns.join(','),
+    ...rows.map(row => columns.map(column => escape(row[column])).join(','))
+  ].join('\n')
+}
+
+function downloadCsv(rows, filename) {
+  const blob = new Blob([toCsv(rows)], { type: 'text/csv;charset=utf-8' })
+  saveAs(blob, `${filename}.csv`)
+}
+
+function downloadXlsx(rows, filename) {
+  const worksheet = XLSX.utils.json_to_sheet(rows)
+  const workbook = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Seguimiento')
+  const output = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+  saveAs(new Blob([output]), `${filename}.xlsx`)
+}
+
+async function parseFile(file) {
   const name = file.name.toLowerCase()
 
   if (name.endsWith('.csv')) {
     const text = await file.text()
-
     return new Promise((resolve, reject) => {
       Papa.parse(text, {
         header: true,
-        skipEmptyLines: 'greedy',
+        skipEmptyLines: false,
+        delimiter: '',
         transformHeader: header => clean(header),
         complete: result => resolve(result.data || []),
         error: reject
@@ -158,529 +267,1195 @@ async function readFile(file) {
   }
 
   const buffer = await file.arrayBuffer()
-  const workbook = XLSX.read(buffer, { type: 'array', cellDates: false })
-  const sheet = workbook.Sheets[workbook.SheetNames[0]]
-  return XLSX.utils.sheet_to_json(sheet, { defval: '' })
+  const workbook = XLSX.read(buffer, { type: 'array', cellDates: true })
+  const sheetName = workbook.SheetNames.includes('BASE') ? 'BASE' : workbook.SheetNames[0]
+  const worksheet = workbook.Sheets[sheetName]
+  return XLSX.utils.sheet_to_json(worksheet, { defval: '' })
 }
 
-function Login() {
-  const [email, setEmail] = useState('admin@grupo-ccm.com')
-  const [password, setPassword] = useState('')
-  const [message, setMessage] = useState('')
+async function selectAll(table, columns = '*', pageSize = 1000) {
+  let from = 0
+  let rows = []
 
-  async function handleLogin(event) {
-    event.preventDefault()
-    setMessage('Validando acceso...')
-
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) setMessage(error.message)
+  while (true) {
+    const to = from + pageSize - 1
+    const { data, error } = await supabase.from(table).select(columns).range(from, to)
+    if (error) throw error
+    rows = rows.concat(data || [])
+    if (!data || data.length < pageSize) break
+    from += pageSize
   }
 
-  return (
-    <main className="login-page">
-      <form className="login-card" onSubmit={handleLogin}>
-        <div className="login-logo">
-          <img src={logoCcm} alt="CCM" />
-        </div>
-        <h1>CRM Clientes CCM</h1>
-        <p>Acceso seguro al módulo de seguimiento</p>
+  return rows
+}
 
-        <label>Email</label>
-        <input value={email} onChange={event => setEmail(event.target.value)} />
+async function getLatestClientVinculacion() {
+  const attempts = ['fecha_vinculacion', 'fecha']
+  for (const column of attempts) {
+    const { data, error } = await supabase
+      .from('clientes_master')
+      .select(column)
+      .not(column, 'is', null)
+      .order(column, { ascending: false })
+      .limit(1)
 
-        <label>Contraseña</label>
-        <input type="password" value={password} onChange={event => setPassword(event.target.value)} />
+    if (!error && data?.[0]?.[column]) return data[0][column]
+  }
+  return ''
+}
 
-        <button type="submit">Entrar</button>
+function mapClienteForExport(row) {
+  return {
+    expediente: row.expediente || '',
+    nombre: row.nombre || '',
+    telefono: row.telefono || '',
+    celular: row.celular || '',
+    correo: row.correo || '',
+    tipo_cliente: row.tipo_cliente || 'SIN CLASIFICAR',
+    ultima_compra: row.ultima_compra || '',
+    primera_compra: row.primera_compra || '',
+    especialidad_servicio_ultima_compra: row.especialidad_servicio_ultima_compra || '',
+    compras_12_meses: row.compras_12m || 0,
+    ticket_promedio_12_meses: Number(row.ticket_promedio_12m || 0),
+    total_comprado_12_meses: Number(row.total_comprado_12m || 0),
+    clasificacion_estrategica: row.clasificacion_estrategica || '',
+    etiqueta_visible: row.etiqueta_visible || '',
+    estado_relacion: row.estado_relacion || '',
+    accion_sugerida: row.accion_sugerida || '',
+    empresa: row.sucursal_empresa || row.empresa || '',
+    observaciones: row.observaciones || '',
+    motivo_inactivo_forzado: row.motivo_inactivo_forzado || ''
+  }
+}
 
-        {message && <div className="error">{message}</div>}
-      </form>
-    </main>
-  )
+function transactionDedupKey(record) {
+  const uuid = clean(record.uuid_documento).toLowerCase()
+  if (uuid) return `uuid:${uuid}`
+
+  const dte = clean(record.dte).toLowerCase()
+  const sello = clean(record.sello).toLowerCase()
+  if (dte && sello) return `dte:${dte}|${sello}`
+
+  const empresa = clean(record.empresa).toLowerCase()
+  const tipo = clean(record.tipo_documento).toLowerCase()
+  const serie = clean(record.serie).toLowerCase()
+  const numero = clean(record.numero_documento).toLowerCase()
+  if (empresa && tipo && serie && numero) return `doc:${empresa}|${tipo}|${serie}|${numero}`
+
+  const noVenta = clean(record.no_venta).toLowerCase()
+  const cliente = clean(record.cliente_expediente).toLowerCase()
+  if (empresa && noVenta && record.fecha && cliente && record.total !== null) {
+    return `old:${empresa}|${noVenta}|${record.fecha}|${cliente}|${Number(record.total).toFixed(2)}`
+  }
+
+  return ''
 }
 
 export default function App() {
   const [session, setSession] = useState(null)
-  const [tab, setTab] = useState('carga')
-  const [message, setMessage] = useState('')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authError, setAuthError] = useState('')
+
+  const [activeTab, setActiveTab] = useState('dashboard')
   const [clientes, setClientes] = useState([])
-  const [cargas, setCargas] = useState([])
+  const [clientesExport, setClientesExport] = useState([])
+  const [comparativoRows, setComparativoRows] = useState([])
+  const [historial, setHistorial] = useState([])
+  const [ultimaTransaccion, setUltimaTransaccion] = useState('')
+  const [ultimaVinculacion, setUltimaVinculacion] = useState('')
+  const [filters, setFilters] = useState(DEFAULT_FILTERS)
+  const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session))
-
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, newSession) => {
       setSession(newSession)
     })
-
     return () => authListener.subscription.unsubscribe()
   }, [])
 
   useEffect(() => {
-    if (session) {
-      loadDashboard()
-      loadCargas()
-    }
+    if (session) loadInitialData()
   }, [session])
 
-  const stats = useMemo(() => {
-    return {
-      clientes: clientes.length,
-      enRiesgo: clientes.filter(row => row.estado_relacion === 'en_riesgo').length,
-      nuevos: clientes.filter(row => String(row.estado_relacion || '').startsWith('nuevo')).length,
-      embajadores: clientes.filter(row => row.clasificacion_estrategica === 'diamante').length
-    }
-  }, [clientes])
+  useEffect(() => {
+    setPage(1)
+  }, [filters.search, filters.tipoCliente, filters.estado, filters.clasificacion])
 
-  async function loadDashboard() {
-    const { data, error } = await supabase
-      .from('v_clientes_operativos_export')
-      .select('*')
-      .limit(1000)
-
-    if (error) setMessage(error.message)
-    else setClientes(data || [])
+  async function signIn(event) {
+    event.preventDefault()
+    setAuthError('')
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: authEmail,
+      password: authPassword
+    })
+    if (signInError) setAuthError(signInError.message)
   }
 
-  async function loadCargas() {
-    const { data, error } = await supabase
-      .from('cargas_archivos')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(30)
-
-    if (!error) setCargas(data || [])
+  async function signOut() {
+    await supabase.auth.signOut()
   }
 
-  async function uploadClientes(file) {
-    if (!file) return
-
+  async function loadInitialData() {
     setLoading(true)
+    setError('')
 
     try {
-      setMessage('Leyendo maestro de clientes...')
-      const rawRows = await readFile(file)
+      const [master, exportRows, comparativo, cargas, latestTx, latestVinculacion] = await Promise.all([
+        selectAll('clientes_master', 'expediente,nombre,telefono,celular,tipo_cliente').catch(() => []),
+        selectAll('v_clientes_operativos_export', '*').catch(() => []),
+        selectAll('v_comparativo_anual_clientes', '*').catch(() => []),
+        supabase
+          .from('cargas_archivos')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(50),
+        supabase
+          .from('v_transacciones_validas')
+          .select('fecha')
+          .order('fecha', { ascending: false })
+          .limit(1),
+        getLatestClientVinculacion()
+      ])
 
-      let invalidas = 0
-      let ignoradas = 0
-      let ultimoExpediente = ''
+      if (cargas.error) throw cargas.error
 
-      const mapped = []
+      const masterRows = (master || []).filter(row => !isExcludedExpediente(row.expediente))
+      const tipoByExpediente = new Map(masterRows.map(row => [row.expediente, row.tipo_cliente || 'SIN CLASIFICAR']))
+      const mergedExportRows = (exportRows || [])
+        .filter(row => !isExcludedExpediente(row.expediente))
+        .map(row => ({
+        ...row,
+        tipo_cliente: row.tipo_cliente || tipoByExpediente.get(row.expediente) || 'SIN CLASIFICAR'
+      }))
 
-      for (const row of rawRows) {
-        if (isRowEmpty(row)) {
-          ignoradas += 1
-          continue
+      setClientes(masterRows)
+      setClientesExport(mergedExportRows)
+      setHistorial(cargas.data || [])
+      setComparativoRows(comparativo || [])
+      setUltimaTransaccion(latestTx.data?.[0]?.fecha || '')
+      setUltimaVinculacion(latestVinculacion || '')
+
+      const years = [...new Set((comparativo || []).map(row => Number(row.anio)).filter(Boolean))].sort((a, b) => b - a)
+      if (years.length && !filters.anioComparativo) {
+        setFilters(current => ({ ...current, anioComparativo: String(years[0]) }))
+      }
+    } catch (loadError) {
+      setError(loadError.message || 'No se pudieron cargar los datos.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function registerLoad(payload) {
+    const { error: loadError } = await supabase.from('cargas_archivos').insert({
+      ...payload,
+      uploaded_by: session?.user?.id || null
+    })
+    if (loadError) throw loadError
+  }
+
+  async function handleClientesFile(file) {
+    if (!file) return
+    setLoading(true)
+    setMessage('')
+    setError('')
+
+    try {
+      const rows = await parseFile(file)
+      let invalidRows = 0
+      let emptyRows = 0
+      const byExpediente = new Map()
+
+      rows.forEach(row => {
+        if (isEmptyRow(row)) {
+          emptyRows += 1
+          return
         }
 
-        const expediente = clean(getValue(row, ['Expediente', 'expediente', 'Número', 'Numero', 'Cliente']))
-        const nombre = clean(getValue(row, ['nombre', 'Nombre', 'NCliente', 'Cliente Nombre']))
-        const tipoCliente = normalizeTipoCliente(getValue(row, [
-          'tipo_cliente',
-          'Tipo cliente',
-          'Tipo de cliente',
-          'NTipo de cliente',
-          'NTipo cliente',
-          'NTipoCliente'
-        ]))
+        const expediente = clean(getValue(row, ['Expediente', 'Numero', 'Número', 'Cliente']))
+        const nombre = clean(getValue(row, ['nombre', 'Nombre', 'NCliente', 'Paciente']))
+        const telefono = clean(getValue(row, ['telefono', 'Teléfono', 'Telefono']))
+        const celular = clean(getValue(row, ['celular', 'Celular']))
+        const tipoCliente = normalizeTipoCliente(getValue(row, ['tipo_cliente', 'NTipo de cliente', 'Tipo de cliente', 'TipoCliente']))
 
         if (!expediente || !nombre) {
-          invalidas += 1
-          continue
+          invalidRows += 1
+          return
         }
 
-        ultimoExpediente = expediente
-
-        mapped.push({
+        byExpediente.set(expediente, {
           expediente,
           nombre,
-          telefono: clean(getValue(row, ['telefono', 'teléfono', 'Telefono', 'Teléfono'])),
-          celular: clean(getValue(row, ['celular', 'Celular'])),
+          telefono,
+          celular,
           tipo_cliente: tipoCliente,
-          correo: clean(getValue(row, ['correo Electronico', 'correo electronico', 'correo', 'email', 'Correo'])),
-          comentarios: clean(getValue(row, ['comentarios', 'comentario', 'Comentarios'])),
-          fecha_vinculacion: parseDate(getValue(row, ['fecha', 'Fecha', 'fecha_vinculacion'])),
           origen: 'maestro',
           raw_json: row
         })
-      }
+      })
 
-      let cargados = 0
+      const payload = Array.from(byExpediente.values())
+      let updated = 0
 
-      for (const [index, group] of chunk(mapped, CLIENT_BATCH_SIZE).entries()) {
-        setMessage(`Cargando maestro de clientes... lote ${index + 1} de ${Math.ceil(mapped.length / CLIENT_BATCH_SIZE)}`)
-
-        const { error } = await supabase
+      for (const batch of chunk(payload, CLIENT_BATCH_SIZE)) {
+        const { error: upsertError } = await supabase
           .from('clientes_master')
-          .upsert(group, { onConflict: 'expediente' })
-
-        if (error) throw error
-        cargados += group.length
+          .upsert(batch, { onConflict: 'expediente' })
+        if (upsertError) throw upsertError
+        updated += batch.length
       }
 
-      await supabase.from('cargas_archivos').insert({
+      await registerLoad({
         tipo_carga: 'clientes',
         nombre_archivo: file.name,
-        filas_archivo: rawRows.length,
-        filas_nuevas: cargados,
-        filas_actualizadas: cargados,
-        filas_invalidas: invalidas,
-        filas_ignoradas: ignoradas,
-        ultimo_expediente_detectado: ultimoExpediente,
-        resumen_json: {
-          campos_oficiales: CLIENT_COLUMNS,
-          modo: 'upsert_por_expediente'
-        },
-        uploaded_by: session?.user?.id || null
+        estado: invalidRows ? 'procesada_con_errores' : 'procesada',
+        filas_archivo: rows.length,
+        filas_nuevas: 0,
+        filas_actualizadas: updated,
+        filas_duplicadas: 0,
+        filas_invalidas: invalidRows,
+        filas_ignoradas: emptyRows,
+        ultimo_expediente_detectado: payload.at(-1)?.expediente || null,
+        resumen_json: { updated, invalidRows, emptyRows }
       })
 
-      setMessage(`Maestro cargado correctamente: ${cargados} clientes actualizados, ${invalidas} inválidos, ${ignoradas} filas vacías ignoradas.`)
-
-      await loadDashboard()
-      await loadCargas()
-    } catch (error) {
-      setMessage(`Error cargando clientes: ${error.message}`)
+      setMessage(`Maestro cargado correctamente: ${formatNumber(updated)} clientes actualizados, ${formatNumber(invalidRows)} inválidos, ${formatNumber(emptyRows)} filas vacías ignoradas.`)
+      await loadInitialData()
+    } catch (uploadError) {
+      setError(uploadError.message || 'Error cargando maestro de clientes.')
     } finally {
       setLoading(false)
     }
   }
 
-  async function ensureClientesFromTransacciones(items) {
-    const unique = new Map()
+  function mapTransaction(row) {
+    const empresa = clean(getValue(row, ['Empresa', 'Sucursal']))
+    const cliente = clean(getValue(row, ['Cliente', 'Expediente']))
+    const nombreCliente = clean(getValue(row, ['NCliente', 'Nombre cliente', 'Nombre']))
+    const fecha = parseDateValue(getValue(row, ['Fecha']))
+    const total = normalizeMoney(getValue(row, ['Total']))
+    const neto = normalizeMoney(getValue(row, ['Neto']))
+    const iva = normalizeMoney(getValue(row, ['I.V.A.', 'IVA', 'I.V.A']))
 
-    for (const item of items) {
-      if (!item.cliente_expediente) continue
-      if (!unique.has(item.cliente_expediente)) {
-        unique.set(item.cliente_expediente, {
-          expediente: item.cliente_expediente,
-          nombre: item.nombre_cliente_transaccion || item.cliente_expediente,
-          origen: 'transaccion',
-          raw_json: { creado_desde_transaccion: true }
-        })
-      }
-    }
-
-    const clientesMinimos = Array.from(unique.values())
-
-    for (const group of chunk(clientesMinimos, CLIENT_BATCH_SIZE)) {
-      const { error } = await supabase
-        .from('clientes_master')
-        .upsert(group, {
-          onConflict: 'expediente',
-          ignoreDuplicates: true
-        })
-
-      if (error) throw error
+    return {
+      no_venta: clean(getValue(row, ['No', 'No.', 'Nº', 'Numero venta', 'Número venta'])),
+      empresa,
+      tipo_documento: clean(getValue(row, ['Tipo Documento', 'Tipo documento', 'TipoDoc'])),
+      serie: clean(getValue(row, ['Serie'])),
+      numero_documento: clean(getValue(row, ['Número', 'Numero', 'No Documento', 'Número Documento'])),
+      dte: clean(getValue(row, ['DTE', 'Número DTE', 'Numero DTE', 'No DTE'])),
+      sello: clean(getValue(row, ['Sello', 'Sello recepción', 'Sello recepcion'])),
+      uuid_documento: clean(getValue(row, ['UUID', 'UID'])),
+      uuid_valido: Boolean(clean(getValue(row, ['UUID', 'UID']))),
+      cliente_expediente: cliente,
+      nombre_cliente_transaccion: nombreCliente,
+      fecha,
+      anulada: isAnulada(getValue(row, ['Anulada', 'Anulado'])),
+      neto: neto ?? 0,
+      iva: iva ?? 0,
+      total,
+      especialidad_servicio: clean(getValue(row, ['especialidad_servicio', 'Especialidad', 'Servicio', 'Especialidad o servicio'])),
+      observaciones: clean(getValue(row, ['Observaciones', 'Comentario', 'Comentarios'])),
+      incluida_analisis: true,
+      raw_json: row
     }
   }
 
-  async function insertTransaccionesBatch(group) {
-    const { error } = await supabase
-      .from('transacciones_clientes')
-      .insert(group)
+  async function insertTransactionBatch(batch) {
+    if (!batch.length) return { inserted: 0, duplicated: 0, failed: 0 }
 
-    if (!error) return { nuevas: group.length, duplicadas: 0, invalidas: 0 }
+    const { error: insertError } = await supabase.from('transacciones_clientes').insert(batch)
 
-    let nuevas = 0
-    let duplicadas = 0
-    let invalidas = 0
+    if (!insertError) return { inserted: batch.length, duplicated: 0, failed: 0 }
 
-    for (const item of group) {
-      const { error: rowError } = await supabase
-        .from('transacciones_clientes')
-        .insert(item)
-
-      if (!rowError) nuevas += 1
-      else if (rowError.code === '23505') duplicadas += 1
-      else invalidas += 1
+    if (batch.length === 1) {
+      const message = `${insertError.message || ''} ${insertError.details || ''}`.toLowerCase()
+      const duplicated = message.includes('duplicate') || message.includes('unique') || insertError.code === '23505'
+      return duplicated ? { inserted: 0, duplicated: 1, failed: 0 } : { inserted: 0, duplicated: 0, failed: 1 }
     }
 
-    return { nuevas, duplicadas, invalidas }
+    const middle = Math.ceil(batch.length / 2)
+    const left = await insertTransactionBatch(batch.slice(0, middle))
+    const right = await insertTransactionBatch(batch.slice(middle))
+
+    return {
+      inserted: left.inserted + right.inserted,
+      duplicated: left.duplicated + right.duplicated,
+      failed: left.failed + right.failed
+    }
   }
 
-  async function uploadTransacciones(file) {
+  async function handleTransaccionesFile(file) {
     if (!file) return
-
     setLoading(true)
+    setMessage('')
+    setError('')
 
     try {
-      setMessage('Leyendo archivo de transacciones...')
-      const rawRows = await readFile(file)
+      const rows = await parseFile(file)
+      const transactions = []
+      const clientesFromTransactions = new Map()
+      const seenKeys = new Set()
 
-      let invalidas = 0
-      let ignoradas = 0
+      let ignoredRows = 0
+      let invalidRows = 0
+      let duplicatedInFile = 0
 
-      const mapped = []
-
-      for (const row of rawRows) {
-        if (isRowEmpty(row)) {
-          ignoradas += 1
-          continue
+      rows.forEach(row => {
+        if (isEmptyRow(row)) {
+          ignoredRows += 1
+          return
         }
 
-        if (isTotalizationRow(row)) {
-          ignoradas += 1
-          continue
+        const record = mapTransaction(row)
+        const clienteNormalized = normalizeHeader(record.cliente_expediente)
+        const nombreNormalized = normalizeHeader(record.nombre_cliente_transaccion)
+
+        if (record.anulada) {
+          ignoredRows += 1
+          return
         }
 
-        const expediente = clean(getValue(row, ['Cliente', 'Expediente', 'Número', 'Numero']))
-        const nombre = clean(getValue(row, ['NCliente', 'nombre', 'Nombre']))
-        const fecha = parseDate(getValue(row, ['Fecha', 'fecha']))
-        const anulada = isAnulada(getValue(row, ['Anulada', 'anulada']))
-        const total = parseMoney(getValue(row, ['Total', 'total']))
-        const neto = parseMoney(getValue(row, ['Neto', 'neto']))
-        const iva = parseMoney(getValue(row, ['I.V.A.', 'IVA', 'iva']))
-        const sucursal = clean(getValue(row, ['Sucursal', 'sucursal'])) || 'SIN SUCURSAL'
-        const tipoDocumento = clean(getValue(row, ['Tipo Documento', 'TipoDocumento', 'tipo_documento'])) || 'SIN TIPO'
-        const serie = clean(getValue(row, ['Serie', 'serie'])) || 'SIN SERIE'
-        const numeroDocumento = clean(getValue(row, ['Número Documento', 'Numero Documento', 'Número', 'Numero', 'No Documento'])) || ''
-        const uuid = clean(getValue(row, ['UUID', 'uuid']))
-        const observaciones = clean(getValue(row, ['Observaciones', 'observaciones']))
-        const especialidadServicio = clean(getValue(row, [
-          'especialidad_servicio',
-          'Especialidad',
-          'Servicio',
-          'Especialidad o servicio',
-          'Descripcion',
-          'Descripción'
-        ]))
-
-        if (anulada || normalizeText(nombre).includes('CLIENTE EXTERNO')) {
-          ignoradas += 1
-          continue
+        if (clienteNormalized === 'cliente externo' || nombreNormalized === 'cliente externo') {
+          ignoredRows += 1
+          return
         }
 
-        if (!expediente || !fecha || !numeroDocumento || total < 0) {
-          invalidas += 1
-          continue
+        const hasUuid = Boolean(record.uuid_documento)
+        const hasDteSello = Boolean(record.dte && record.sello)
+        const hasDocumentoTradicional = Boolean(record.empresa && record.tipo_documento && record.serie && record.numero_documento)
+        const hasFallbackAntiguo = Boolean(record.empresa && record.no_venta && record.fecha && record.cliente_expediente && record.total !== null)
+        const valid = record.cliente_expediente && record.fecha && record.total !== null && record.total >= 0 && (
+          hasUuid || hasDteSello || hasDocumentoTradicional || hasFallbackAntiguo
+        )
+
+        if (!valid) {
+          invalidRows += 1
+          return
         }
 
-        mapped.push({
-          uuid_documento: uuid || null,
-          uuid_valido: Boolean(uuid),
-          sucursal,
-          tipo_documento: tipoDocumento,
-          serie,
-          numero_documento: numeroDocumento,
-          cliente_expediente: expediente,
-          nombre_cliente_transaccion: nombre || expediente,
-          fecha,
-          especialidad_servicio: especialidadServicio || null,
-          neto,
-          iva,
-          total,
-          observaciones,
-          anulada: false,
-          incluida_analisis: true,
-          raw_json: row
-        })
-      }
+        const key = transactionDedupKey(record)
+        if (!key) {
+          invalidRows += 1
+          return
+        }
 
-      await ensureClientesFromTransacciones(mapped)
+        if (seenKeys.has(key)) {
+          duplicatedInFile += 1
+          return
+        }
 
-      let nuevas = 0
-      let duplicadas = 0
-      let invalidasInsert = 0
+        seenKeys.add(key)
+        transactions.push(record)
 
-      const groups = chunk(mapped, TX_BATCH_SIZE)
-
-      for (const [index, group] of groups.entries()) {
-        setMessage(`Cargando transacciones... lote ${index + 1} de ${groups.length}`)
-
-        const result = await insertTransaccionesBatch(group)
-        nuevas += result.nuevas
-        duplicadas += result.duplicadas
-        invalidasInsert += result.invalidas
-      }
-
-      await supabase.from('cargas_archivos').insert({
-        tipo_carga: 'transacciones',
-        nombre_archivo: file.name,
-        fecha_inicio_dato: mapped.length ? mapped.map(row => row.fecha).sort()[0] : null,
-        fecha_fin_dato: mapped.length ? mapped.map(row => row.fecha).sort().at(-1) : null,
-        filas_archivo: rawRows.length,
-        filas_nuevas: nuevas,
-        filas_duplicadas: duplicadas,
-        filas_invalidas: invalidas + invalidasInsert,
-        filas_ignoradas: ignoradas,
-        resumen_json: {
-          modo: 'insert_batch_con_fallback_por_fila',
-          deduplicacion: 'UUID o Sucursal+Tipo Documento+Serie+Número'
-        },
-        uploaded_by: session?.user?.id || null
+        if (record.cliente_expediente) {
+          clientesFromTransactions.set(record.cliente_expediente, {
+            expediente: record.cliente_expediente,
+            nombre: record.nombre_cliente_transaccion || record.cliente_expediente,
+            tipo_cliente: 'SIN CLASIFICAR',
+            origen: 'transaccion'
+          })
+        }
       })
 
-      setMessage(`Transacciones cargadas: ${nuevas} nuevas, ${duplicadas} duplicadas, ${invalidas + invalidasInsert} inválidas, ${ignoradas} ignoradas.`)
+      let inserted = 0
+      let duplicated = duplicatedInFile
+      let failed = 0
 
-      await loadDashboard()
-      await loadCargas()
-    } catch (error) {
-      setMessage(`Error cargando transacciones: ${error.message}`)
+      for (const batch of chunk(Array.from(clientesFromTransactions.values()), CLIENT_BATCH_SIZE)) {
+        const { error: clientError } = await supabase
+          .from('clientes_master')
+          .upsert(batch, { onConflict: 'expediente', ignoreDuplicates: true })
+        if (clientError) throw clientError
+      }
+
+      for (const batch of chunk(transactions, TX_BATCH_SIZE)) {
+        const result = await insertTransactionBatch(batch)
+        inserted += result.inserted
+        duplicated += result.duplicated
+        failed += result.failed
+      }
+
+      await registerLoad({
+        tipo_carga: 'transacciones',
+        nombre_archivo: file.name,
+        estado: invalidRows || failed ? 'procesada_con_errores' : 'procesada',
+        filas_archivo: rows.length,
+        filas_nuevas: inserted,
+        filas_actualizadas: 0,
+        filas_duplicadas: duplicated,
+        filas_invalidas: invalidRows + failed,
+        filas_ignoradas: ignoredRows,
+        resumen_json: { inserted, duplicated, duplicatedInFile, invalidRows, failed, ignoredRows }
+      })
+
+      setMessage(`Transacciones procesadas: ${formatNumber(inserted)} nuevas, ${formatNumber(duplicated)} duplicadas, ${formatNumber(invalidRows + failed)} inválidas, ${formatNumber(ignoredRows)} ignoradas.`)
+      await loadInitialData()
+    } catch (uploadError) {
+      setError(uploadError.message || 'Error cargando transacciones.')
     } finally {
       setLoading(false)
     }
   }
 
-  function exportar(formato) {
-    const rows = clientes.map(row => ({
-      expediente: row.expediente,
-      nombre: row.nombre,
-      telefono: row.telefono,
-      celular: row.celular,
-      correo: row.correo,
-      ultima_compra: row.ultima_compra,
-      primera_compra: row.primera_compra,
-      compras_12m: row.compras_12m,
-      ticket_promedio_12m: row.ticket_promedio_12m,
-      total_comprado_12m: row.total_comprado_12m,
-      clasificacion_estrategica: row.clasificacion_estrategica,
-      etiqueta_visible: row.etiqueta_visible,
-      estado_relacion: row.estado_relacion,
-      accion_sugerida: row.accion_sugerida,
-      sucursal_empresa: row.sucursal_empresa,
-      observaciones: row.observaciones,
-      motivo_inactivo_forzado: row.motivo_inactivo_forzado
-    }))
+  const updateInfo = useMemo(() => {
+    const latestClientLoad = historial.find(row => row.tipo_carga === 'clientes')
+    const latestTxLoad = historial.find(row => row.tipo_carga === 'transacciones')
 
-    const worksheet = XLSX.utils.json_to_sheet(rows)
-
-    if (formato === 'csv') {
-      const csv = XLSX.utils.sheet_to_csv(worksheet)
-      saveAs(new Blob([csv], { type: 'text/csv;charset=utf-8' }), 'Seguimiento clientes.csv')
-      return
+    return {
+      clientesFechaCarga: latestClientLoad?.created_at || '',
+      clientesVinculadosHasta: ultimaVinculacion || '',
+      ultimoExpediente: latestClientLoad?.ultimo_expediente_detectado || '',
+      txFechaCarga: latestTxLoad?.created_at || '',
+      txHasta: ultimaTransaccion || ''
     }
+  }, [historial, ultimaTransaccion, ultimaVinculacion])
 
-    const workbook = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Seguimiento clientes')
-    const buffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
-    saveAs(new Blob([buffer]), 'Seguimiento clientes.xlsx')
+  const filteredClientes = useMemo(() => {
+    const search = normalizeHeader(filters.search)
+
+    return clientesExport.filter(row => {
+      if (isExcludedExpediente(row.expediente)) return false
+
+      const matchesSearch = !search || [
+        row.expediente,
+        row.nombre,
+        row.telefono,
+        row.celular
+      ].some(value => normalizeHeader(value).includes(search))
+
+      const matchesTipo = filters.tipoCliente === 'todos' || row.tipo_cliente === filters.tipoCliente
+      const matchesEstado = filters.estado === 'todos' || row.estado_relacion === filters.estado
+      const matchesClasificacion = filters.clasificacion === 'todos' || row.clasificacion_estrategica === filters.clasificacion
+
+      return matchesSearch && matchesTipo && matchesEstado && matchesClasificacion
+    })
+  }, [clientesExport, filters])
+
+  const totalPages = Math.max(1, Math.ceil(filteredClientes.length / PAGE_SIZE))
+  const paginatedClientes = filteredClientes.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+
+  const tipoOptions = useMemo(() => {
+    return [...new Set(clientes.map(row => row.tipo_cliente || 'SIN CLASIFICAR'))].sort()
+  }, [clientes])
+
+  const estadoOptions = useMemo(() => {
+    return [...new Set(clientesExport.map(row => row.estado_relacion).filter(Boolean))]
+      .sort((a, b) => (RELATION_ORDER[a] || 99) - (RELATION_ORDER[b] || 99))
+  }, [clientesExport])
+
+  const clasificacionOptions = useMemo(() => {
+    return [...new Set(clientesExport.map(row => row.clasificacion_estrategica).filter(Boolean))]
+      .sort((a, b) => (STRATEGY_ORDER[a] || 99) - (STRATEGY_ORDER[b] || 99))
+  }, [clientesExport])
+
+  const comparativoYears = useMemo(() => {
+    return [...new Set(comparativoRows.map(row => Number(row.anio)).filter(Boolean))].sort((a, b) => b - a)
+  }, [comparativoRows])
+
+  const filteredComparativo = useMemo(() => {
+    const grouped = new Map()
+
+    comparativoRows.forEach(row => {
+      const matchesYear = !filters.anioComparativo || String(row.anio) === String(filters.anioComparativo)
+      const matchesTipo = filters.tipoClienteComparativo === 'todos' || row.tipo_cliente === filters.tipoClienteComparativo
+      if (!matchesYear || !matchesTipo) return
+
+      const key = `${row.anio}-${String(row.mes).padStart(2, '0')}`
+      const current = grouped.get(key) || {
+        anio: Number(row.anio),
+        mes: Number(row.mes),
+        mes_nombre: row.mes_nombre,
+        tipo_cliente: filters.tipoClienteComparativo === 'todos' ? 'TODOS' : filters.tipoClienteComparativo,
+        pacientes_nuevos: 0,
+        pacientes_antiguos: 0,
+        ingreso_nuevos: 0,
+        ingreso_antiguos: 0,
+        ingreso_total: 0
+      }
+
+      current.pacientes_nuevos += Number(row.pacientes_nuevos || 0)
+      current.pacientes_antiguos += Number(row.pacientes_antiguos || 0)
+      current.ingreso_nuevos += Number(row.ingreso_nuevos || 0)
+      current.ingreso_antiguos += Number(row.ingreso_antiguos || 0)
+      current.ingreso_total += Number(row.ingreso_total || 0)
+
+      grouped.set(key, current)
+    })
+
+    return [...grouped.values()]
+      .map(row => {
+        const totalPacientes = row.pacientes_nuevos + row.pacientes_antiguos
+        const promedioNuevos = row.pacientes_nuevos ? row.ingreso_nuevos / row.pacientes_nuevos : 0
+        const promedioAntiguos = row.pacientes_antiguos ? row.ingreso_antiguos / row.pacientes_antiguos : 0
+
+        return {
+          ...row,
+          total_pacientes: totalPacientes,
+          porcentaje_nuevos: totalPacientes ? row.pacientes_nuevos / totalPacientes : 0,
+          promedio_nuevos: promedioNuevos,
+          promedio_antiguos: promedioAntiguos,
+          diferencia_promedio_n_vs_a: promedioNuevos && promedioAntiguos ? promedioNuevos - promedioAntiguos : 0
+        }
+      })
+      .sort((a, b) => Number(a.mes) - Number(b.mes))
+  }, [comparativoRows, filters.anioComparativo, filters.tipoClienteComparativo])
+
+  const kpis = useMemo(() => {
+    const total = filteredClientes.length
+    const conCompra = filteredClientes.filter(row => row.ultima_compra).length
+    const riesgo = filteredClientes.filter(row => ['vigilancia', 'en_riesgo', 'inactivo_reciente'].includes(row.estado_relacion)).length
+    const nuevosSinRecompra = filteredClientes.filter(row => row.estado_relacion === 'nuevo_sin_recompra').length
+    const embajadores = filteredClientes.filter(row => row.clasificacion_estrategica === 'diamante').length
+    const total12m = filteredClientes.reduce((sum, row) => sum + Number(row.total_comprado_12m || 0), 0)
+    return { total, conCompra, riesgo, nuevosSinRecompra, embajadores, total12m }
+  }, [filteredClientes])
+
+  const estadoDistribution = useMemo(() => {
+    const counts = {}
+    filteredClientes.forEach(row => {
+      const key = row.estado_relacion || 'sin_estado'
+      counts[key] = (counts[key] || 0) + 1
+    })
+    return Object.entries(counts)
+      .map(([key, value]) => ({ key, label: humanLabel(key), value }))
+      .sort((a, b) => (RELATION_ORDER[a.key] || 99) - (RELATION_ORDER[b.key] || 99))
+  }, [filteredClientes])
+
+  const clasificacionDistribution = useMemo(() => {
+    const visibleByKey = new Map()
+    const counts = {}
+
+    filteredClientes.forEach(row => {
+      const key = row.clasificacion_estrategica || 'sin_clasificacion'
+      counts[key] = (counts[key] || 0) + 1
+      visibleByKey.set(key, row.etiqueta_visible || humanLabel(key))
+    })
+
+    return Object.entries(counts)
+      .map(([key, value]) => ({ key, label: visibleByKey.get(key), value }))
+      .sort((a, b) => (STRATEGY_ORDER[a.key] || 99) - (STRATEGY_ORDER[b.key] || 99))
+  }, [filteredClientes])
+
+  const comparativoKpis = useMemo(() => {
+    const nuevos = filteredComparativo.reduce((sum, row) => sum + Number(row.pacientes_nuevos || 0), 0)
+    const antiguos = filteredComparativo.reduce((sum, row) => sum + Number(row.pacientes_antiguos || 0), 0)
+    const ingresoNuevos = filteredComparativo.reduce((sum, row) => sum + Number(row.ingreso_nuevos || 0), 0)
+    const ingresoAntiguos = filteredComparativo.reduce((sum, row) => sum + Number(row.ingreso_antiguos || 0), 0)
+    const promedioNuevos = nuevos ? ingresoNuevos / nuevos : 0
+    const promedioAntiguos = antiguos ? ingresoAntiguos / antiguos : 0
+    return { nuevos, antiguos, ingresoNuevos, ingresoAntiguos, promedioNuevos, promedioAntiguos }
+  }, [filteredComparativo])
+
+  function updateFilter(key, value) {
+    setFilters(current => ({ ...current, [key]: value }))
   }
 
-  if (!session) return <Login />
+  function exportFilteredClientes(format) {
+    const rows = filteredClientes.map(mapClienteForExport)
+    const filename = `Seguimiento clientes ${new Date().toISOString().slice(0, 10)}`
+    if (format === 'xlsx') downloadXlsx(rows, filename)
+    else downloadCsv(rows, filename)
+  }
+
+  function exportComparativo(format) {
+    const rows = filteredComparativo.map(row => ({
+      anio: row.anio,
+      mes: row.mes_nombre,
+      tipo_cliente_filtro: row.tipo_cliente,
+      pacientes_nuevos: row.pacientes_nuevos,
+      pacientes_antiguos: row.pacientes_antiguos,
+      total_pacientes: row.total_pacientes,
+      porcentaje_nuevos: row.porcentaje_nuevos,
+      ingreso_nuevos: row.ingreso_nuevos,
+      promedio_nuevos: row.promedio_nuevos,
+      ingreso_antiguos: row.ingreso_antiguos,
+      promedio_antiguos: row.promedio_antiguos,
+      diferencia_promedio_n_vs_a: row.diferencia_promedio_n_vs_a,
+      ingreso_total: row.ingreso_total
+    }))
+    const filename = `Comparativo anual ${filters.anioComparativo || 'todos'}`
+    if (format === 'xlsx') downloadXlsx(rows, filename)
+    else downloadCsv(rows, filename)
+  }
+
+  if (!session) {
+    return (
+      <div className="login-shell">
+        <section className="login-card">
+          <img src={logoCcm} alt="CCM" className="login-logo" />
+          <h1>CRM Clientes CCM</h1>
+          <p>Seguimiento comercial de pacientes, scoring y transacciones.</p>
+
+          {authError && <div className="alert error">{authError}</div>}
+
+          <form onSubmit={signIn} className="login-form">
+            <label>
+              Correo
+              <input value={authEmail} onChange={event => setAuthEmail(event.target.value)} type="email" autoComplete="email" />
+            </label>
+            <label>
+              Contraseña
+              <input value={authPassword} onChange={event => setAuthPassword(event.target.value)} type="password" autoComplete="current-password" />
+            </label>
+            <button className="primary" type="submit">Entrar</button>
+          </form>
+        </section>
+      </div>
+    )
+  }
 
   return (
-    <main className="app">
-      <header>
-        <div className="brand">
-          <div className="brand-logo">
-            <img src={logoCcm} alt="CCM" />
+    <div className="app-shell">
+      <header className="app-header">
+        <div className="topbar">
+          <div className="brand">
+            <div className="logo-box">
+              <img src={logoCcm} alt="CCM" />
+            </div>
+            <div>
+              <h1>CRM Clientes CCM</h1>
+              <p>Dashboard operativo de pacientes, scoring y seguimiento.</p>
+            </div>
           </div>
-          <div>
-            <h1>CRM Clientes CCM</h1>
-            <p>Carga, scoring y seguimiento comercial</p>
+
+          <div className="top-actions">
+            <div className="update-badge subtle" title="Referencia discreta de actualización de datos">
+              {updateInfo.ultimoExpediente ? `Último expediente ${updateInfo.ultimoExpediente}` : 'Último expediente —'}
+              {` · Transacciones hasta: ${formatDate(updateInfo.txHasta)}`}
+            </div>
+            <span className="user-pill">{session.user.email}</span>
+            <button className="ghost" onClick={loadInitialData} disabled={loading}>Actualizar</button>
+            <button className="secondary" onClick={signOut}>Salir</button>
           </div>
         </div>
 
-        <button className="secondary" onClick={() => supabase.auth.signOut()}>Salir</button>
+        <nav className="tabs">
+          {TABS.map(tab => (
+            <button
+              key={tab.key}
+              className={activeTab === tab.key ? 'active' : ''}
+              onClick={() => setActiveTab(tab.key)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
       </header>
 
-      <nav>
-        {['carga', 'dashboard', 'exportar', 'historial'].map(item => (
-          <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>
-            {item}
-          </button>
-        ))}
-      </nav>
+      <main className="app-main">
+        {error && <div className="alert error">{error}</div>}
+        {message && <div className="alert success">{message}</div>}
+        {loading && <div className="alert info">Procesando / actualizando datos...</div>}
 
-      {message && <div className="message">{message}</div>}
-
-      {tab === 'carga' && (
-        <section className="grid">
-          <div className="card">
-            <h2>Maestro de clientes</h2>
-            <p>CSV UTF-8 recomendado. Campos oficiales: Expediente, nombre, telefono, celular, tipo_cliente.</p>
-            <input
-              type="file"
-              accept=".csv,.xlsx,.xls"
-              disabled={loading}
-              onChange={event => uploadClientes(event.target.files?.[0])}
-            />
-            <small>No duplica clientes: actualiza por Expediente.</small>
-          </div>
-
-          <div className="card">
-            <h2>Transacciones</h2>
-            <p>CSV o XLSX. Excluye anuladas, Cliente Externo y filas vacías.</p>
-            <input
-              type="file"
-              accept=".csv,.xlsx,.xls"
-              disabled={loading}
-              onChange={event => uploadTransacciones(event.target.files?.[0])}
-            />
-            <small>No duplica documentos: usa UUID o fallback documental.</small>
-          </div>
-        </section>
-      )}
-
-      {tab === 'dashboard' && (
-        <section>
-          <div className="stats">
-            <div><span>Clientes</span><strong>{stats.clientes}</strong></div>
-            <div><span>En riesgo</span><strong>{stats.enRiesgo}</strong></div>
-            <div><span>Nuevos</span><strong>{stats.nuevos}</strong></div>
-            <div><span>Embajadores</span><strong>{stats.embajadores}</strong></div>
-          </div>
-
-          <Table
-            rows={clientes}
-            columns={[
-              'expediente',
-              'nombre',
-              'ultima_compra',
-              'clasificacion_estrategica',
-              'etiqueta_visible',
-              'estado_relacion',
-              'accion_sugerida'
-            ]}
+        {['dashboard', 'clientes', 'exportar'].includes(activeTab) && (
+          <Filters
+            filters={filters}
+            updateFilter={updateFilter}
+            tipoOptions={tipoOptions}
+            estadoOptions={estadoOptions}
+            clasificacionOptions={clasificacionOptions}
           />
-        </section>
-      )}
+        )}
 
-      {tab === 'exportar' && (
-        <section className="card">
-          <h2>Exportar Seguimiento clientes</h2>
-          <p>Descarga la base operativa actual para seguimiento comercial.</p>
-          <button onClick={() => exportar('xlsx')}>Descargar Excel</button>
-          <button onClick={() => exportar('csv')}>Descargar CSV</button>
-        </section>
-      )}
+        {activeTab === 'dashboard' && (
+          <>
+            <section className="kpi-grid">
+              <KpiCard title="Clientes filtrados" value={formatNumber(kpis.total)} helper="Base operativa según filtros." />
+              <KpiCard title="Con compra histórica" value={formatNumber(kpis.conCompra)} helper="Clientes con al menos una transacción válida." />
+              <KpiCard title="Riesgo operativo" value={formatNumber(kpis.riesgo)} helper="Vigilancia, en riesgo o inactivo reciente." tone="warning" />
+              <KpiCard title="Nuevos sin recompra" value={formatNumber(kpis.nuevosSinRecompra)} helper="Primera compra reciente sin recompra." tone="danger" />
+              <KpiCard title="Embajadores" value={formatNumber(kpis.embajadores)} helper="Clientes Diamante según score." tone="success" />
+              <KpiCard title="Total 12 meses" value={formatMoney(kpis.total12m)} helper="Compras dentro de ventana móvil 12m." tone="primary" />
+            </section>
 
-      {tab === 'historial' && (
-        <Table
-          rows={cargas}
-          columns={[
-            'created_at',
-            'tipo_carga',
-            'nombre_archivo',
-            'filas_archivo',
-            'filas_nuevas',
-            'filas_actualizadas',
-            'filas_duplicadas',
-            'filas_invalidas',
-            'filas_ignoradas'
-          ]}
-        />
-      )}
-    </main>
+            <section className="dashboard-grid">
+              <DistributionCard title="Estado de relación" subtitle="Distribución relativa sobre clientes filtrados." rows={estadoDistribution} total={filteredClientes.length} type="estado" />
+              <StrategyMosaic rows={clasificacionDistribution} total={filteredClientes.length} />
+            </section>
+
+            <ClientesTable
+              rows={paginatedClientes}
+              page={page}
+              totalPages={totalPages}
+              setPage={setPage}
+              totalRows={filteredClientes.length}
+              exportFilteredClientes={exportFilteredClientes}
+            />
+          </>
+        )}
+
+        {activeTab === 'clientes' && (
+          <ClientesTable
+            rows={paginatedClientes}
+            page={page}
+            totalPages={totalPages}
+            setPage={setPage}
+            totalRows={filteredClientes.length}
+            exportFilteredClientes={exportFilteredClientes}
+          />
+        )}
+
+        {activeTab === 'comparativo' && (
+          <ComparativoTab
+            rows={filteredComparativo}
+            years={comparativoYears}
+            tipoOptions={tipoOptions}
+            filters={filters}
+            updateFilter={updateFilter}
+            kpis={comparativoKpis}
+            exportComparativo={exportComparativo}
+          />
+        )}
+
+        {activeTab === 'exportar' && (
+          <section className="card export-card">
+            <div>
+              <h2>Exportar seguimiento</h2>
+              <p>Descarga la tabla de clientes resultante de los filtros activos.</p>
+              <p className="muted">{formatNumber(filteredClientes.length)} clientes listos para seguimiento.</p>
+            </div>
+            <div className="actions">
+              <button className="primary" onClick={() => exportFilteredClientes('xlsx')}>Descargar XLSX</button>
+              <button className="secondary" onClick={() => exportFilteredClientes('csv')}>Descargar CSV</button>
+            </div>
+          </section>
+        )}
+
+        {activeTab === 'carga' && (
+          <section className="upload-grid">
+            <UploadCard
+              title="Maestro de clientes"
+              description="CSV UTF-8 con Expediente, nombre, telefono, celular y tipo_cliente. Actualiza por expediente, no duplica."
+              accept=".csv,.xlsx,.xls"
+              onFile={handleClientesFile}
+            />
+            <UploadCard
+              title="Transacciones"
+              description="CSV/XLSX de facturación. Excluye anuladas y Cliente Externo; deduplica por UUID, DTE+Sello o documento."
+              accept=".csv,.xlsx,.xls"
+              onFile={handleTransaccionesFile}
+            />
+          </section>
+        )}
+
+        {activeTab === 'historial' && (
+          <section className="card">
+            <div className="section-head">
+              <div>
+                <h2>Historial de cargas</h2>
+                <p>Últimos archivos procesados y trazabilidad del resultado.</p>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fecha</th>
+                    <th>Tipo</th>
+                    <th>Archivo</th>
+                    <th>Estado</th>
+                    <th>Nuevas</th>
+                    <th>Actualizadas</th>
+                    <th>Duplicadas</th>
+                    <th>Inválidas</th>
+                    <th>Ignoradas</th>
+                    <th>Último expediente</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {historial.map(row => (
+                    <tr key={row.id}>
+                      <td>{formatDateTime(row.created_at)}</td>
+                      <td><Badge value={row.tipo_carga} type="tipo" /></td>
+                      <td>{row.nombre_archivo}</td>
+                      <td><Badge value={row.estado} type="estado" /></td>
+                      <td>{formatNumber(row.filas_nuevas)}</td>
+                      <td>{formatNumber(row.filas_actualizadas)}</td>
+                      <td>{formatNumber(row.filas_duplicadas)}</td>
+                      <td>{formatNumber(row.filas_invalidas)}</td>
+                      <td>{formatNumber(row.filas_ignoradas)}</td>
+                      <td>{row.ultimo_expediente_detectado || '—'}</td>
+                    </tr>
+                  ))}
+                  {!historial.length && (
+                    <tr>
+                      <td colSpan="10" className="empty">No hay cargas registradas.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {activeTab === 'logica' && <LogicTab />}
+      </main>
+    </div>
   )
 }
 
-function Table({ rows, columns }) {
+function Filters({ filters, updateFilter, tipoOptions, estadoOptions, clasificacionOptions }) {
   return (
-    <div className="card table-wrap">
-      <table>
-        <thead>
-          <tr>{columns.map(column => <th key={column}>{column}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.slice(0, 100).map((row, index) => (
-            <tr key={index}>
-              {columns.map(column => <td key={column}>{String(row[column] ?? '')}</td>)}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <section className="filters card">
+      <label>
+        Buscar
+        <input
+          placeholder="Expediente, nombre, teléfono o celular"
+          value={filters.search}
+          onChange={event => updateFilter('search', event.target.value)}
+        />
+      </label>
+
+      <label>
+        Tipo de cliente
+        <select value={filters.tipoCliente} onChange={event => updateFilter('tipoCliente', event.target.value)}>
+          <option value="todos">Todos</option>
+          {tipoOptions.map(option => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </label>
+
+      <label>
+        Estado de relación
+        <select value={filters.estado} onChange={event => updateFilter('estado', event.target.value)}>
+          <option value="todos">Todos</option>
+          {estadoOptions.map(option => <option key={option} value={option}>{humanLabel(option)}</option>)}
+        </select>
+      </label>
+
+      <label>
+        Clasificación
+        <select value={filters.clasificacion} onChange={event => updateFilter('clasificacion', event.target.value)}>
+          <option value="todos">Todas</option>
+          {clasificacionOptions.map(option => <option key={option} value={option}>{humanLabel(option)}</option>)}
+        </select>
+      </label>
+    </section>
   )
+}
+
+function KpiCard({ title, value, helper, tone = 'neutral' }) {
+  return (
+    <article className={`kpi-card ${tone}`}>
+      <span>{title}</span>
+      <strong>{value}</strong>
+      <p>{helper}</p>
+    </article>
+  )
+}
+
+function DistributionCard({ title, subtitle, rows, total, type }) {
+  return (
+    <section className="card">
+      <div className="section-head">
+        <div>
+          <h2>{title}</h2>
+          <p>{subtitle}</p>
+        </div>
+      </div>
+      <div className="distribution-list">
+        {rows.map(row => (
+          <div className="distribution-row" key={row.key}>
+            <div className="distribution-top">
+              <span><Badge value={row.label} type={type} rawKey={row.key} /></span>
+              <strong>{formatNumber(row.value)} · {percent(row.value, total)}</strong>
+            </div>
+            <div className="progress">
+              <i style={{ width: percent(row.value, total) }} />
+            </div>
+          </div>
+        ))}
+        {!rows.length && <p className="empty">No hay datos para mostrar.</p>}
+      </div>
+    </section>
+  )
+}
+
+function StrategyMosaic({ rows, total }) {
+  const max = Math.max(...rows.map(row => row.value), 1)
+
+  return (
+    <section className="card">
+      <div className="section-head">
+        <div>
+          <h2>Clasificación estratégica</h2>
+          <p>Mosaico relativo por valor comercial según recencia, frecuencia y ticket.</p>
+        </div>
+      </div>
+      <div className="strategy-mosaic">
+        {rows.map(row => {
+          const strength = Math.max(0.3, Number(row.value || 0) / max)
+          return (
+            <article
+              key={row.key}
+              className={`mosaic-tile strategy-${slug(row.key)}`}
+              style={{ flexGrow: Math.max(1, row.value), minHeight: `${86 + strength * 80}px` }}
+            >
+              <span>{row.label}</span>
+              <strong>{formatNumber(row.value)}</strong>
+              <small>{percent(row.value, total)}</small>
+            </article>
+          )
+        })}
+        {!rows.length && <p className="empty">No hay datos para mostrar.</p>}
+      </div>
+    </section>
+  )
+}
+
+function ClientesTable({ rows, page, totalPages, setPage, totalRows, exportFilteredClientes }) {
+  return (
+    <section className="card">
+      <div className="section-head">
+        <div>
+          <h2>Clientes</h2>
+          <p>{formatNumber(totalRows)} clientes resultantes de los filtros.</p>
+        </div>
+        <div className="actions">
+          <button className="primary" onClick={() => exportFilteredClientes('xlsx')}>Descargar XLSX</button>
+          <button className="secondary" onClick={() => exportFilteredClientes('csv')}>Descargar CSV</button>
+        </div>
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Expediente</th>
+              <th>Nombre</th>
+              <th>Tipo</th>
+              <th>Teléfono</th>
+              <th>Celular</th>
+              <th>Última compra</th>
+              <th>Estado</th>
+              <th>Clasificación</th>
+              <th>Total 12m</th>
+              <th>Acción sugerida</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(row => (
+              <tr key={row.expediente}>
+                <td><strong>{row.expediente}</strong></td>
+                <td>{row.nombre}</td>
+                <td><Badge value={row.tipo_cliente || 'SIN CLASIFICAR'} type="tipo" /></td>
+                <td>{row.telefono || '—'}</td>
+                <td>{row.celular || '—'}</td>
+                <td>{formatDate(row.ultima_compra)}</td>
+                <td><Badge value={humanLabel(row.estado_relacion)} type="estado" rawKey={row.estado_relacion} /></td>
+                <td><Badge value={row.etiqueta_visible || humanLabel(row.clasificacion_estrategica)} type="clasificacion" rawKey={row.clasificacion_estrategica} /></td>
+                <td>{formatMoney(row.total_comprado_12m)}</td>
+                <td>{row.accion_sugerida || '—'}</td>
+              </tr>
+            ))}
+            {!rows.length && (
+              <tr>
+                <td colSpan="10" className="empty">No hay registros para los filtros seleccionados.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="pagination">
+        <button className="secondary" onClick={() => setPage(current => Math.max(1, current - 1))} disabled={page <= 1}>Anterior</button>
+        <span>Página {page} de {totalPages}</span>
+        <button className="secondary" onClick={() => setPage(current => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>Siguiente</button>
+      </div>
+    </section>
+  )
+}
+
+function ComparativoTab({ rows, years, tipoOptions, filters, updateFilter, kpis, exportComparativo }) {
+  return (
+    <>
+      <section className="filters card">
+        <label>
+          Año
+          <select value={filters.anioComparativo} onChange={event => updateFilter('anioComparativo', event.target.value)}>
+            {years.map(year => <option key={year} value={year}>{year}</option>)}
+          </select>
+        </label>
+        <label>
+          Tipo de cliente
+          <select value={filters.tipoClienteComparativo} onChange={event => updateFilter('tipoClienteComparativo', event.target.value)}>
+            <option value="todos">Todos</option>
+            {tipoOptions.map(option => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </label>
+      </section>
+
+      <section className="kpi-grid compact">
+        <KpiCard title="Pacientes nuevos" value={formatNumber(kpis.nuevos)} helper="Primera compra histórica en el mes." />
+        <KpiCard title="Pacientes antiguos" value={formatNumber(kpis.antiguos)} helper="Compraron en el mes, pero ya tenían compras previas." />
+        <KpiCard title="Ingreso nuevos" value={formatMoney(kpis.ingresoNuevos)} helper={`Promedio: ${formatMoney(kpis.promedioNuevos)}`} tone="success" />
+        <KpiCard title="Ingreso antiguos" value={formatMoney(kpis.ingresoAntiguos)} helper={`Promedio: ${formatMoney(kpis.promedioAntiguos)}`} tone="primary" />
+      </section>
+
+      <section className="card">
+        <div className="section-head">
+          <div>
+            <h2>Comparativo anual: nuevos vs antiguos</h2>
+            <p>La tabla se consolida por mes según el filtro seleccionado. Promedio = facturación / cantidad de pacientes.</p>
+          </div>
+          <div className="actions">
+            <button className="primary" onClick={() => exportComparativo('xlsx')}>Descargar XLSX</button>
+            <button className="secondary" onClick={() => exportComparativo('csv')}>Descargar CSV</button>
+          </div>
+        </div>
+
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Mes</th>
+                <th>Nuevos</th>
+                <th>Antiguos</th>
+                <th>Total pacientes</th>
+                <th>% nuevos</th>
+                <th>Ingreso nuevos</th>
+                <th>Prom. nuevos</th>
+                <th>Ingreso antiguos</th>
+                <th>Prom. antiguos</th>
+                <th>Diferencia prom.</th>
+                <th>Ingreso total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(row => (
+                <tr key={`${row.anio}-${row.mes}`}>
+                  <td><strong>{row.mes_nombre}</strong></td>
+                  <td>{formatNumber(row.pacientes_nuevos)}</td>
+                  <td>{formatNumber(row.pacientes_antiguos)}</td>
+                  <td>{formatNumber(row.total_pacientes)}</td>
+                  <td>{`${(Number(row.porcentaje_nuevos || 0) * 100).toFixed(1)}%`}</td>
+                  <td>{formatMoney(row.ingreso_nuevos)}</td>
+                  <td>{formatMoney(row.promedio_nuevos)}</td>
+                  <td>{formatMoney(row.ingreso_antiguos)}</td>
+                  <td>{formatMoney(row.promedio_antiguos)}</td>
+                  <td>{formatMoney(row.diferencia_promedio_n_vs_a)}</td>
+                  <td>{formatMoney(row.ingreso_total)}</td>
+                </tr>
+              ))}
+              {!rows.length && (
+                <tr>
+                  <td colSpan="11" className="empty">No hay datos para el filtro seleccionado.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
+  )
+}
+
+function UploadCard({ title, description, accept, onFile }) {
+  return (
+    <section className="card upload-card">
+      <h2>{title}</h2>
+      <p>{description}</p>
+      <label className="dropzone">
+        <input
+          type="file"
+          accept={accept}
+          onChange={event => onFile(event.target.files?.[0])}
+        />
+        <span>Seleccionar archivo</span>
+        <small>CSV UTF-8, XLSX o XLS</small>
+      </label>
+    </section>
+  )
+}
+
+function LogicTab() {
+  return (
+    <section className="logic-grid">
+      <article className="card logic-hero">
+        <h2>Lógica del reporte</h2>
+        <p>
+          Este dashboard consolida maestro de clientes y transacciones válidas para clasificar valor,
+          estado de relación y oportunidades de seguimiento comercial. La lógica está pensada para
+          priorizar gestión, no para copiar hojas de Excel.
+        </p>
+      </article>
+
+      <article className="card logic-card">
+        <h3>1. Cliente y expediente</h3>
+        <p>
+          <strong>Expediente</strong> es la clave única del paciente/cliente. El maestro se actualiza
+          por expediente y no duplica registros.
+        </p>
+        <p>
+          En transacciones, el campo <strong>Cliente</strong> representa el expediente. <strong>NCliente</strong>
+          es solo nombre referencial y no se usa como llave.
+        </p>
+      </article>
+
+      <article className="card logic-card">
+        <h3>2. Transacciones válidas</h3>
+        <p>
+          Se consideran documentos no anulados, con fecha, expediente y total válido. Se excluyen anuladas,
+          Cliente Externo y el expediente 3864 por ser cliente varios/no regular.
+        </p>
+        <p>
+          La deduplicación usa UUID cuando existe; si no, usa DTE + sello, documento tradicional o fallback
+          documental para registros antiguos.
+        </p>
+      </article>
+
+      <article className="card logic-card">
+        <h3>3. Clasificación estratégica</h3>
+        <p>
+          Mide valor comercial del cliente con ventana móvil de 12 meses. Usa recencia, frecuencia y ticket
+          promedio con pesos configurables.
+        </p>
+        <p>
+          Esta clasificación responde: <strong>¿qué valor estratégico tiene este cliente?</strong>
+        </p>
+      </article>
+
+      <article className="card logic-card">
+        <h3>4. Etiquetas visibles</h3>
+        <ul>
+          <li><strong>En desarrollo:</strong> clientes de menor valor comercial actual.</li>
+          <li><strong>En consolidación:</strong> clientes con potencial, pero aún no plenamente fidelizados.</li>
+          <li><strong>Fiel:</strong> clientes de buen valor y comportamiento positivo.</li>
+          <li><strong>Embajador:</strong> clientes de mayor valor estratégico.</li>
+        </ul>
+      </article>
+
+      <article className="card logic-card">
+        <h3>5. Estado de relación</h3>
+        <p>
+          Mide el momento actual del cliente y se mantiene separado del valor estratégico.
+          Un cliente puede ser Fiel y estar En riesgo al mismo tiempo.
+        </p>
+        <p>
+          Esta capa responde: <strong>¿qué acción comercial o de seguimiento necesita ahora?</strong>
+        </p>
+      </article>
+
+      <article className="card logic-card">
+        <h3>6. Cliente nuevo</h3>
+        <p>
+          Un cliente nuevo es aquel cuya primera compra histórica ocurre dentro del período reciente.
+          Si compra varias veces en el mismo mes de su primera compra, todo ese ingreso cuenta como nuevo.
+        </p>
+        <p>
+          Si compra después de su mes de primera compra, ya se clasifica como antiguo para efectos comparativos.
+        </p>
+      </article>
+    </section>
+  )
+}
+
+function Badge({ value, type = 'default', rawKey }) {
+  const key = slug(rawKey || value)
+  return <span className={`badge badge-${type} badge-${key}`}>{value || '—'}</span>
 }
