@@ -996,3 +996,30 @@ tr:hover td {
   white-space: normal;
   overflow-wrap: anywhere;
 }
+/* Corrección visual de KPIs: asegurar que el valor acumulado sea visible */
+.kpi-card strong {
+  color: var(--text) !important;
+  display: block;
+  font-weight: 900;
+  margin: 8px 0 6px;
+}
+
+.kpi-card.primary strong {
+  color: var(--primary) !important;
+}
+
+.kpi-card.success strong {
+  color: var(--success) !important;
+}
+
+.kpi-card.warning strong {
+  color: var(--warning) !important;
+}
+
+.kpi-card.danger strong {
+  color: var(--danger) !important;
+}
+
+.kpi-card p {
+  color: var(--muted) !important;
+}
