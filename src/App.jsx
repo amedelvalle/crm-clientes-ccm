@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './lib/supabase'
 import Papa from 'papaparse'
 import * as XLSX from 'xlsx'
@@ -47,6 +47,75 @@ const STRATEGY_ORDER = {
   plata: 2,
   oro: 3,
   diamante: 4
+}
+
+const OPERATIONAL_LISTS = [
+  {
+    key: 'fieles_en_riesgo',
+    title: 'Fieles en riesgo',
+    description: 'Clientes Oro con señales de deterioro comercial.',
+    action: 'Seguimiento comercial preventivo',
+    tone: 'warning'
+  },
+  {
+    key: 'embajadores_en_riesgo',
+    title: 'Embajadores en riesgo',
+    description: 'Clientes Diamante que requieren contacto prioritario.',
+    action: 'Contacto personalizado prioritario',
+    tone: 'danger'
+  },
+  {
+    key: 'nuevos_sin_recompra',
+    title: 'Nuevos sin recompra',
+    description: 'Clientes nuevos que aún no han realizado recompra.',
+    action: 'Impulsar segunda compra',
+    tone: 'info'
+  },
+  {
+    key: 'inactivos_recientes_recuperables',
+    title: 'Inactivos recientes recuperables',
+    description: 'Clientes Plata, Oro o Diamante con inactividad reciente.',
+    action: 'Campaña de recuperación',
+    tone: 'warning'
+  },
+  {
+    key: 'recuperados',
+    title: 'Recuperados',
+    description: 'Clientes que volvieron después de estar en riesgo o inactivos.',
+    action: 'Agradecer retorno y fidelizar',
+    tone: 'success'
+  },
+  {
+    key: 'inactivos_forzados',
+    title: 'Inactivos forzados',
+    description: 'Clientes marcados para no gestión comercial.',
+    action: 'No contactar comercialmente',
+    tone: 'neutral'
+  }
+]
+
+function matchesOperationalList(row, key) {
+  if (!row || isExcludedExpediente(row.expediente)) return false
+
+  const estado = row.estado_relacion
+  const clasificacion = row.clasificacion_estrategica
+
+  switch (key) {
+    case 'fieles_en_riesgo':
+      return clasificacion === 'oro' && ['vigilancia', 'en_riesgo', 'inactivo_reciente'].includes(estado)
+    case 'embajadores_en_riesgo':
+      return clasificacion === 'diamante' && ['vigilancia', 'en_riesgo', 'inactivo_reciente'].includes(estado)
+    case 'nuevos_sin_recompra':
+      return estado === 'nuevo_sin_recompra'
+    case 'inactivos_recientes_recuperables':
+      return estado === 'inactivo_reciente' && ['plata', 'oro', 'diamante'].includes(clasificacion)
+    case 'recuperados':
+      return estado === 'recuperado'
+    case 'inactivos_forzados':
+      return estado === 'inactivo_forzado'
+    default:
+      return true
+  }
 }
 
 function clean(value) {
@@ -274,34 +343,67 @@ async function parseFile(file) {
 }
 
 async function selectAll(table, columns = '*', pageSize = 1000) {
-  let from = 0
-  let rows = []
+  const { count, error: countError } = await supabase
+    .from(table)
+    .select(columns, { count: 'exact', head: true })
 
-  while (true) {
-    const to = from + pageSize - 1
-    const { data, error } = await supabase.from(table).select(columns).range(from, to)
-    if (error) throw error
-    rows = rows.concat(data || [])
-    if (!data || data.length < pageSize) break
-    from += pageSize
+  if (countError || typeof count !== 'number') {
+    console.warn(`No se pudo contar ${table}; se usará carga secuencial.`, countError?.message || countError)
+
+    let from = 0
+    let rows = []
+
+    while (true) {
+      const to = from + pageSize - 1
+      const { data, error } = await supabase.from(table).select(columns).range(from, to)
+      if (error) throw error
+      rows = rows.concat(data || [])
+      if (!data || data.length < pageSize) break
+      from += pageSize
+    }
+
+    return rows
+  }
+
+  if (count === 0) return []
+
+  const ranges = []
+  for (let from = 0; from < count; from += pageSize) {
+    ranges.push([from, Math.min(from + pageSize - 1, count - 1)])
+  }
+
+  const rows = []
+  const concurrency = 16
+
+  for (let index = 0; index < ranges.length; index += concurrency) {
+    const batch = ranges.slice(index, index + concurrency)
+    const results = await Promise.all(
+      batch.map(([from, to]) => supabase.from(table).select(columns).range(from, to))
+    )
+
+    results.forEach(({ data, error }) => {
+      if (error) throw error
+      rows.push(...(data || []))
+    })
   }
 
   return rows
 }
 
 async function getLatestClientVinculacion() {
-  const attempts = ['fecha_vinculacion', 'fecha']
-  for (const column of attempts) {
-    const { data, error } = await supabase
-      .from('clientes_master')
-      .select(column)
-      .not(column, 'is', null)
-      .order(column, { ascending: false })
-      .limit(1)
+  const { data, error } = await supabase
+    .from('clientes_master')
+    .select('fecha_vinculacion')
+    .not('fecha_vinculacion', 'is', null)
+    .order('fecha_vinculacion', { ascending: false })
+    .limit(1)
 
-    if (!error && data?.[0]?.[column]) return data[0][column]
+  if (error) {
+    console.warn('No se pudo obtener la última fecha de vinculación:', error.message)
+    return ''
   }
-  return ''
+
+  return data?.[0]?.fecha_vinculacion || ''
 }
 
 function mapClienteForExport(row) {
@@ -365,10 +467,17 @@ export default function App() {
   const [ultimaTransaccion, setUltimaTransaccion] = useState('')
   const [ultimaVinculacion, setUltimaVinculacion] = useState('')
   const [filters, setFilters] = useState(DEFAULT_FILTERS)
+  const [activeOperationalList, setActiveOperationalList] = useState('')
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
+  const [detalleOpen, setDetalleOpen] = useState(false)
+  const [detalleLoading, setDetalleLoading] = useState(false)
+  const [detalleError, setDetalleError] = useState('')
+  const [clienteDetalle, setClienteDetalle] = useState(null)
+  const initialLoadStartedRef = useRef(false)
+  const comparativoLoadStartedRef = useRef(false)
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session))
@@ -379,12 +488,29 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (session) loadInitialData()
+    if (!session) {
+      initialLoadStartedRef.current = false
+      comparativoLoadStartedRef.current = false
+      return
+    }
+
+    if (initialLoadStartedRef.current) return
+
+    initialLoadStartedRef.current = true
+    loadInitialData()
   }, [session])
 
   useEffect(() => {
+    if (!session || activeTab !== 'comparativo') return
+    if (comparativoLoadStartedRef.current) return
+
+    comparativoLoadStartedRef.current = true
+    loadComparativoData()
+  }, [session, activeTab])
+
+  useEffect(() => {
     setPage(1)
-  }, [filters.search, filters.tipoCliente, filters.estado, filters.clasificacion])
+  }, [filters.search, filters.tipoCliente, filters.estado, filters.clasificacion, activeOperationalList])
 
   async function signIn(event) {
     event.preventDefault()
@@ -405,10 +531,8 @@ export default function App() {
     setError('')
 
     try {
-      const [master, exportRows, comparativo, cargas, latestTx, latestVinculacion] = await Promise.all([
-        selectAll('clientes_master', 'expediente,nombre,telefono,celular,tipo_cliente').catch(() => []),
-        selectAll('v_clientes_operativos_export', '*').catch(() => []),
-        selectAll('v_comparativo_anual_clientes', '*').catch(() => []),
+      const [exportRows, cargas, latestTx, latestVinculacion] = await Promise.all([
+        selectAll('mv_clientes_operativos_export', '*').catch(() => []),
         supabase
           .from('cargas_archivos')
           .select('*')
@@ -424,30 +548,151 @@ export default function App() {
 
       if (cargas.error) throw cargas.error
 
-      const masterRows = (master || []).filter(row => !isExcludedExpediente(row.expediente))
-      const tipoByExpediente = new Map(masterRows.map(row => [row.expediente, row.tipo_cliente || 'SIN CLASIFICAR']))
       const mergedExportRows = (exportRows || [])
         .filter(row => !isExcludedExpediente(row.expediente))
         .map(row => ({
-        ...row,
-        tipo_cliente: row.tipo_cliente || tipoByExpediente.get(row.expediente) || 'SIN CLASIFICAR'
-      }))
+          ...row,
+          tipo_cliente: row.tipo_cliente || 'SIN CLASIFICAR'
+        }))
 
-      setClientes(masterRows)
+      setClientes(mergedExportRows)
       setClientesExport(mergedExportRows)
       setHistorial(cargas.data || [])
-      setComparativoRows(comparativo || [])
       setUltimaTransaccion(latestTx.data?.[0]?.fecha || '')
       setUltimaVinculacion(latestVinculacion || '')
+    } catch (loadError) {
+      setError(loadError.message || 'No se pudieron cargar los datos.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function loadComparativoData() {
+    try {
+      const comparativo = await selectAll('v_comparativo_anual_clientes', '*').catch(() => [])
+
+      setComparativoRows(comparativo || [])
 
       const years = [...new Set((comparativo || []).map(row => Number(row.anio)).filter(Boolean))].sort((a, b) => b - a)
       if (years.length && !filters.anioComparativo) {
         setFilters(current => ({ ...current, anioComparativo: String(years[0]) }))
       }
     } catch (loadError) {
-      setError(loadError.message || 'No se pudieron cargar los datos.')
+      console.warn('No se pudo cargar el comparativo anual:', loadError.message || loadError)
+    }
+  }
+
+  async function openClienteDetalle(expediente) {
+    const expedienteText = String(expediente || '').trim()
+    if (!expedienteText || EXCLUDED_EXPEDIENTES.has(expedienteText)) return
+
+    setDetalleOpen(true)
+    setDetalleLoading(true)
+    setDetalleError('')
+    setClienteDetalle(null)
+
+    try {
+      const [estadoRes, masterRes, transaccionesRes, historicoCountRes] = await Promise.all([
+        supabase
+          .from('v_clientes_estado_relacion')
+          .select('*')
+          .eq('expediente', expedienteText)
+          .maybeSingle(),
+        supabase
+          .from('clientes_master')
+          .select('expediente,nombre,telefono,celular,correo,comentarios,fecha_vinculacion,tipo_cliente,inactivo_forzado_manual,motivo_inactivo_forzado_manual,comentario_inactivo_forzado_manual,fecha_inactivo_forzado_manual,usuario_inactivo_forzado_manual')
+          .eq('expediente', expedienteText)
+          .maybeSingle(),
+        supabase
+          .from('v_transacciones_validas')
+          .select('fecha,empresa,tipo_documento,serie,numero_documento,total,observaciones')
+          .eq('cliente_expediente', expedienteText)
+          .order('fecha', { ascending: false })
+          .limit(10),
+        supabase
+          .from('v_transacciones_validas')
+          .select('cliente_expediente', { count: 'exact', head: true })
+          .eq('cliente_expediente', expedienteText)
+      ])
+
+      if (estadoRes.error) throw estadoRes.error
+      if (masterRes.error) throw masterRes.error
+      if (transaccionesRes.error) throw transaccionesRes.error
+      if (historicoCountRes.error) throw historicoCountRes.error
+
+      setClienteDetalle({
+        expediente: expedienteText,
+        estado: estadoRes.data || null,
+        maestro: masterRes.data || null,
+        transacciones: transaccionesRes.data || [],
+        comprasHistoricas: historicoCountRes.count || 0
+      })
+    } catch (detalleLoadError) {
+      console.warn('No se pudo cargar el detalle del cliente:', detalleLoadError.message || detalleLoadError)
+      setDetalleError('No se pudo cargar el detalle del cliente. Intenta nuevamente.')
     } finally {
-      setLoading(false)
+      setDetalleLoading(false)
+    }
+  }
+
+  function closeClienteDetalle() {
+    setDetalleOpen(false)
+    setDetalleLoading(false)
+    setDetalleError('')
+    setClienteDetalle(null)
+  }
+
+  async function refreshClienteDetalle(expediente) {
+    const expedienteText = String(expediente || '').trim()
+    if (!expedienteText || EXCLUDED_EXPEDIENTES.has(expedienteText)) return
+
+    setDetalleLoading(true)
+    setDetalleError('')
+
+    try {
+      const [estadoRes, masterRes, rowRes] = await Promise.all([
+        supabase
+          .from('v_clientes_estado_relacion')
+          .select('*')
+          .eq('expediente', expedienteText)
+          .maybeSingle(),
+        supabase
+          .from('clientes_master')
+          .select('expediente,nombre,telefono,celular,correo,comentarios,fecha_vinculacion,tipo_cliente,inactivo_forzado_manual,motivo_inactivo_forzado_manual,comentario_inactivo_forzado_manual,fecha_inactivo_forzado_manual,usuario_inactivo_forzado_manual')
+          .eq('expediente', expedienteText)
+          .maybeSingle(),
+        supabase
+          .from('mv_clientes_operativos_export')
+          .select('*')
+          .eq('expediente', expedienteText)
+          .maybeSingle()
+      ])
+
+      if (estadoRes.error) throw estadoRes.error
+      if (masterRes.error) throw masterRes.error
+      if (rowRes.error) throw rowRes.error
+
+      setClienteDetalle(current => ({
+        ...(current || {}),
+        expediente: expedienteText,
+        estado: estadoRes.data || null,
+        maestro: masterRes.data || null
+      }))
+
+      if (rowRes.data) {
+        const updatedRow = {
+          ...rowRes.data,
+          tipo_cliente: rowRes.data.tipo_cliente || 'SIN CLASIFICAR'
+        }
+
+        setClientes(current => current.map(row => String(row.expediente) === expedienteText ? updatedRow : row))
+        setClientesExport(current => current.map(row => String(row.expediente) === expedienteText ? updatedRow : row))
+      }
+    } catch (refreshError) {
+      console.warn('No se pudo refrescar el cliente después del cambio:', refreshError.message || refreshError)
+      setDetalleError('El cambio se guardó, pero no se pudo refrescar la ficha automáticamente. Recarga la pantalla.')
+    } finally {
+      setDetalleLoading(false)
     }
   }
 
@@ -716,11 +961,26 @@ export default function App() {
     }
   }, [historial, ultimaTransaccion, ultimaVinculacion])
 
+  const operationalListCounts = useMemo(() => {
+    return OPERATIONAL_LISTS.reduce((acc, list) => {
+      acc[list.key] = clientesExport.filter(row => matchesOperationalList(row, list.key)).length
+      return acc
+    }, {})
+  }, [clientesExport])
+
+  const activeOperationalListDef = useMemo(() => {
+    return OPERATIONAL_LISTS.find(list => list.key === activeOperationalList) || null
+  }, [activeOperationalList])
+
   const filteredClientes = useMemo(() => {
     const search = normalizeHeader(filters.search)
 
     return clientesExport.filter(row => {
       if (isExcludedExpediente(row.expediente)) return false
+
+      if (activeOperationalList && !matchesOperationalList(row, activeOperationalList)) {
+        return false
+      }
 
       const matchesSearch = !search || [
         row.expediente,
@@ -729,16 +989,17 @@ export default function App() {
         row.celular
       ].some(value => normalizeHeader(value).includes(search))
 
-      const matchesTipo = filters.tipoCliente === 'todos' || row.tipo_cliente === filters.tipoCliente
-      const matchesEstado = filters.estado === 'todos' || row.estado_relacion === filters.estado
-      const matchesClasificacion = filters.clasificacion === 'todos' || row.clasificacion_estrategica === filters.clasificacion
+      const matchesTipo = activeOperationalList || filters.tipoCliente === 'todos' || row.tipo_cliente === filters.tipoCliente
+      const matchesEstado = activeOperationalList || filters.estado === 'todos' || row.estado_relacion === filters.estado
+      const matchesClasificacion = activeOperationalList || filters.clasificacion === 'todos' || row.clasificacion_estrategica === filters.clasificacion
 
       return matchesSearch && matchesTipo && matchesEstado && matchesClasificacion
     })
-  }, [clientesExport, filters])
+  }, [clientesExport, filters, activeOperationalList])
 
   const totalPages = Math.max(1, Math.ceil(filteredClientes.length / PAGE_SIZE))
   const paginatedClientes = filteredClientes.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+
 
   const tipoOptions = useMemo(() => {
     return [...new Set(clientes.map(row => row.tipo_cliente || 'SIN CLASIFICAR'))].sort()
@@ -853,12 +1114,29 @@ export default function App() {
   }, [filteredComparativo])
 
   function updateFilter(key, value) {
+    setActiveOperationalList('')
     setFilters(current => ({ ...current, [key]: value }))
+  }
+
+  function selectOperationalList(key) {
+    setActiveOperationalList(current => current === key ? '' : key)
+    setFilters(current => ({
+      ...current,
+      search: '',
+      tipoCliente: 'todos',
+      estado: 'todos',
+      clasificacion: 'todos'
+    }))
+  }
+
+  function clearOperationalList() {
+    setActiveOperationalList('')
   }
 
   function exportFilteredClientes(format) {
     const rows = filteredClientes.map(mapClienteForExport)
-    const filename = `Seguimiento clientes ${new Date().toISOString().slice(0, 10)}`
+    const listSuffix = activeOperationalListDef ? ` - ${activeOperationalListDef.title}` : ''
+    const filename = `Seguimiento clientes${listSuffix} ${new Date().toISOString().slice(0, 10)}`
     if (format === 'xlsx') downloadXlsx(rows, filename)
     else downloadCsv(rows, filename)
   }
@@ -986,6 +1264,7 @@ export default function App() {
               setPage={setPage}
               totalRows={filteredClientes.length}
               exportFilteredClientes={exportFilteredClientes}
+              onOpenClienteDetalle={openClienteDetalle}
             />
           </>
         )}
@@ -998,6 +1277,7 @@ export default function App() {
             setPage={setPage}
             totalRows={filteredClientes.length}
             exportFilteredClientes={exportFilteredClientes}
+            onOpenClienteDetalle={openClienteDetalle}
           />
         )}
 
@@ -1014,17 +1294,31 @@ export default function App() {
         )}
 
         {activeTab === 'exportar' && (
-          <section className="card export-card">
-            <div>
-              <h2>Exportar seguimiento</h2>
-              <p>Descarga la tabla de clientes resultante de los filtros activos.</p>
-              <p className="muted">{formatNumber(filteredClientes.length)} clientes listos para seguimiento.</p>
-            </div>
-            <div className="actions">
-              <button className="primary" onClick={() => exportFilteredClientes('xlsx')}>Descargar XLSX</button>
-              <button className="secondary" onClick={() => exportFilteredClientes('csv')}>Descargar CSV</button>
-            </div>
-          </section>
+          <>
+            <OperationalListsPanel
+              lists={OPERATIONAL_LISTS}
+              counts={operationalListCounts}
+              activeKey={activeOperationalList}
+              onSelect={selectOperationalList}
+              onClear={clearOperationalList}
+            />
+
+            <section className="card export-card">
+              <div>
+                <h2>Exportar seguimiento</h2>
+                <p>
+                  {activeOperationalListDef
+                    ? `Lista activa: ${activeOperationalListDef.title}. ${activeOperationalListDef.action}.`
+                    : 'Descarga la tabla de clientes resultante de los filtros activos.'}
+                </p>
+                <p className="muted">{formatNumber(filteredClientes.length)} clientes listos para seguimiento.</p>
+              </div>
+              <div className="actions">
+                <button className="primary" onClick={() => exportFilteredClientes('xlsx')}>Descargar XLSX</button>
+                <button className="secondary" onClick={() => exportFilteredClientes('csv')}>Descargar CSV</button>
+              </div>
+            </section>
+          </>
         )}
 
         {activeTab === 'carga' && (
@@ -1096,8 +1390,729 @@ export default function App() {
 
         {activeTab === 'logica' && <LogicTab />}
       </main>
+
+      <ClienteDetalleModal
+        open={detalleOpen}
+        loading={detalleLoading}
+        error={detalleError}
+        detalle={clienteDetalle}
+        currentUserEmail={session?.user?.email || session?.user?.id || ''}
+        onNoGestionarSaved={refreshClienteDetalle}
+        onClose={closeClienteDetalle}
+      />
     </div>
   )
+}
+
+const modalStyles = {
+  overlay: {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(15, 23, 42, 0.45)',
+    zIndex: 50,
+    display: 'flex',
+    justifyContent: 'flex-end'
+  },
+  panel: {
+    width: 'min(980px, 100%)',
+    height: '100%',
+    overflowY: 'auto',
+    background: '#f8fbff',
+    boxShadow: '-20px 0 40px rgba(15, 23, 42, 0.18)',
+    padding: '24px'
+  },
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: '16px',
+    alignItems: 'flex-start',
+    marginBottom: '16px'
+  },
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: '12px',
+    marginTop: '12px'
+  },
+  item: {
+    background: '#fff',
+    border: '1px solid #dbe7f7',
+    borderRadius: '14px',
+    padding: '12px'
+  },
+  label: {
+    display: 'block',
+    fontSize: '11px',
+    fontWeight: 800,
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
+    color: '#64748b',
+    marginBottom: '6px'
+  },
+  value: {
+    color: '#0f172a',
+    fontWeight: 700
+  }
+}
+
+function DetailItem({ label, value }) {
+  return (
+    <div style={modalStyles.item}>
+      <span style={modalStyles.label}>{label}</span>
+      <span style={modalStyles.value}>{value || '—'}</span>
+    </div>
+  )
+}
+
+function ClienteDetalleModal({ open, loading, error, detalle, currentUserEmail, onNoGestionarSaved, onClose }) {
+  const [noGestionar, setNoGestionar] = useState(false)
+  const [motivoNoGestionar, setMotivoNoGestionar] = useState('')
+  const [comentarioNoGestionar, setComentarioNoGestionar] = useState('')
+  const [savingNoGestionar, setSavingNoGestionar] = useState(false)
+  const [noGestionarError, setNoGestionarError] = useState('')
+  const [noGestionarMessage, setNoGestionarMessage] = useState('')
+
+  const estado = detalle?.estado || {}
+  const maestro = detalle?.maestro || {}
+  const transacciones = detalle?.transacciones || []
+  const expediente = detalle?.expediente || estado.expediente || maestro.expediente || ''
+  const nombre = maestro.nombre || estado.nombre || 'Cliente'
+  const tipoCliente = maestro.tipo_cliente || estado.tipo_cliente || 'SIN CLASIFICAR'
+  const inactivoForzado = Boolean(estado.inactivo_forzado || maestro.inactivo_forzado_manual)
+  const motivoInactivoForzado = estado.motivo_inactivo_forzado || maestro.motivo_inactivo_forzado_manual || '—'
+  const score = Number(estado.nota_final)
+  const hasScore = Number.isFinite(score)
+  const clasificacion = !hasScore ? '—' : score < 15 ? 'bronce' : score < 25 ? 'plata' : score < 35 ? 'oro' : 'diamante'
+  const etiquetaVisible = !hasScore ? '—' : score < 15 ? 'En desarrollo' : score < 25 ? 'En consolidación' : score < 35 ? 'Fiel' : 'Embajador'
+
+  useEffect(() => {
+    if (!open) return
+
+    const manualActivo = Boolean(maestro.inactivo_forzado_manual || estado.inactivo_forzado)
+    setNoGestionar(manualActivo)
+    setMotivoNoGestionar(
+      maestro.motivo_inactivo_forzado_manual ||
+      estado.motivo_inactivo_forzado ||
+      ''
+    )
+    setComentarioNoGestionar(maestro.comentario_inactivo_forzado_manual || '')
+    setNoGestionarError('')
+    setNoGestionarMessage('')
+  }, [
+    open,
+    expediente,
+    maestro.inactivo_forzado_manual,
+    maestro.motivo_inactivo_forzado_manual,
+    maestro.comentario_inactivo_forzado_manual,
+    estado.inactivo_forzado,
+    estado.motivo_inactivo_forzado
+  ])
+
+  async function handleGuardarNoGestionar() {
+    if (!expediente) return
+
+    const motivo = clean(motivoNoGestionar)
+    const comentario = clean(comentarioNoGestionar)
+
+    if (noGestionar && !motivo) {
+      setNoGestionarError('Selecciona un motivo para marcar al cliente como no gestionable.')
+      return
+    }
+
+    setSavingNoGestionar(true)
+    setNoGestionarError('')
+    setNoGestionarMessage('')
+
+    try {
+      const { error: rpcError } = await supabase.rpc('marcar_cliente_no_gestionar', {
+        p_expediente: String(expediente),
+        p_no_gestionar: Boolean(noGestionar),
+        p_motivo: noGestionar ? motivo : null,
+        p_comentario: noGestionar ? comentario : null,
+        p_usuario: currentUserEmail || 'CRM'
+      })
+
+      if (rpcError) throw rpcError
+
+      await onNoGestionarSaved?.(expediente)
+      setNoGestionarMessage(noGestionar
+        ? 'Cliente marcado como no gestionable.'
+        : 'Cliente habilitado nuevamente para gestión comercial.'
+      )
+    } catch (saveError) {
+      console.warn('No se pudo guardar No gestionar:', saveError.message || saveError)
+      setNoGestionarError(saveError.message || 'No se pudo guardar el cambio.')
+    } finally {
+      setSavingNoGestionar(false)
+    }
+  }
+
+  if (!open) return null
+
+  return (
+    <div style={modalStyles.overlay} role="dialog" aria-modal="true">
+      <aside style={modalStyles.panel}>
+        <div style={modalStyles.header}>
+          <div>
+            <p className="eyebrow">Ficha individual</p>
+            <h2>{nombre}</h2>
+            <p className="muted">Expediente {expediente || '—'}</p>
+          </div>
+          <button className="secondary" onClick={onClose}>Cerrar</button>
+        </div>
+
+        {loading && <div className="alert info">Cargando detalle del cliente...</div>}
+        {error && <div className="alert error">{error}</div>}
+
+        {!loading && !error && detalle && (
+          <>
+            <section className="card">
+              <div className="section-head">
+                <div>
+                  <h3>Identificación</h3>
+                  <p>Datos maestros y contacto disponible.</p>
+                </div>
+              </div>
+              <div style={modalStyles.grid}>
+                <DetailItem label="Expediente" value={expediente} />
+                <DetailItem label="Nombre" value={nombre} />
+                <DetailItem label="Tipo cliente" value={tipoCliente} />
+                <DetailItem label="Teléfono" value={maestro.telefono || estado.telefono} />
+                <DetailItem label="Celular" value={maestro.celular || estado.celular} />
+                <DetailItem label="Correo" value={maestro.correo || estado.correo} />
+                <DetailItem label="Fecha de vinculación" value={formatDate(maestro.fecha_vinculacion || estado.fecha_vinculacion)} />
+              </div>
+            </section>
+
+            <section className="card">
+              <div className="section-head">
+                <div>
+                  <h3>Estado comercial</h3>
+                  <p>Valor estratégico separado del estado de relación.</p>
+                </div>
+              </div>
+              <div style={modalStyles.grid}>
+                <DetailItem label="Clasificación" value={clasificacion === '—' ? '—' : humanLabel(clasificacion)} />
+                <DetailItem label="Etiqueta visible" value={etiquetaVisible} />
+                <DetailItem label="Estado relación" value={humanLabel(estado.estado_relacion)} />
+                <DetailItem label="Acción sugerida" value={
+                  estado.estado_relacion === 'nuevo_reciente' ? 'Dar bienvenida y registrar seguimiento' :
+                  estado.estado_relacion === 'nuevo_en_seguimiento' ? 'Contactar para continuidad' :
+                  estado.estado_relacion === 'nuevo_sin_recompra' ? 'Priorizar recompra / próxima cita' :
+                  estado.estado_relacion === 'activo' ? 'Mantener relación' :
+                  estado.estado_relacion === 'vigilancia' ? 'Seguimiento preventivo' :
+                  estado.estado_relacion === 'en_riesgo' ? 'Contactar para recuperación' :
+                  estado.estado_relacion === 'inactivo_reciente' ? 'Campaña de reactivación' :
+                  estado.estado_relacion === 'inactivo_prolongado' ? 'Revisar antes de contactar' :
+                  estado.estado_relacion === 'recuperado' ? 'Agradecer retorno y fidelizar' :
+                  estado.estado_relacion === 'inactivo_forzado' ? 'No contactar comercialmente' :
+                  'Revisar caso'
+                } />
+                <DetailItem label="Inactivo forzado" value={inactivoForzado ? 'Sí' : 'No'} />
+                <DetailItem label="Motivo inactivo forzado" value={motivoInactivoForzado} />
+              </div>
+            </section>
+
+            <section
+              className="card"
+              style={{
+                border: noGestionar ? '1px solid #fecaca' : '1px solid #bfdbfe',
+                background: noGestionar ? '#fff7f7' : '#ffffff',
+                borderRadius: '22px',
+                boxShadow: '0 14px 34px rgba(15, 23, 42, 0.08)'
+              }}
+            >
+              <div
+                className="section-head"
+                style={{ alignItems: 'flex-start', gap: '16px' }}
+              >
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                  <div
+                    style={{
+                      width: '42px',
+                      height: '42px',
+                      borderRadius: '14px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      background: noGestionar ? '#fee2e2' : '#eff6ff',
+                      color: noGestionar ? '#991b1b' : '#1d4ed8',
+                      fontSize: '20px',
+                      flex: '0 0 auto'
+                    }}
+                  >
+                    🛡️
+                  </div>
+                  <div>
+                    <h3 style={{ margin: 0 }}>Gestión comercial</h3>
+                    <p style={{ margin: '4px 0 0', color: '#64748b' }}>
+                      Define si este cliente debe excluirse de campañas, llamadas y listas operativas futuras.
+                    </p>
+                  </div>
+                </div>
+
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    minHeight: '28px',
+                    padding: '5px 10px',
+                    borderRadius: '999px',
+                    background: noGestionar ? '#fee2e2' : '#dcfce7',
+                    color: noGestionar ? '#991b1b' : '#166534',
+                    fontSize: '11px',
+                    fontWeight: 800,
+                    letterSpacing: '0.03em',
+                    textTransform: 'uppercase'
+                  }}
+                >
+                  {noGestionar ? 'No gestionar' : 'Gestionable'}
+                </span>
+              </div>
+
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: '12px',
+                  marginBottom: '14px'
+                }}
+              >
+                <div
+                  style={{
+                    border: '1px solid #e2e8f0',
+                    borderRadius: '16px',
+                    padding: '12px',
+                    background: '#f8fafc'
+                  }}
+                >
+                  <span style={modalStyles.label}>Estado actual</span>
+                  <span style={modalStyles.value}>{humanLabel(estado.estado_relacion)}</span>
+                </div>
+                <div
+                  style={{
+                    border: '1px solid #e2e8f0',
+                    borderRadius: '16px',
+                    padding: '12px',
+                    background: '#f8fafc'
+                  }}
+                >
+                  <span style={modalStyles.label}>Motivo registrado</span>
+                  <span style={modalStyles.value}>{noGestionar ? motivoNoGestionar || motivoInactivoForzado : '—'}</span>
+                </div>
+              </div>
+
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '14px',
+                  padding: '14px',
+                  borderRadius: '18px',
+                  border: '1px solid #e2e8f0',
+                  background: '#ffffff',
+                  cursor: 'pointer'
+                }}
+              >
+                <span>
+                  <span
+                    style={{
+                      display: 'block',
+                      fontSize: '14px',
+                      fontWeight: 800,
+                      color: '#0f172a'
+                    }}
+                  >
+                    No gestionar comercialmente
+                  </span>
+                  <span
+                    style={{
+                      display: 'block',
+                      marginTop: '3px',
+                      fontSize: '12px',
+                      color: '#64748b',
+                      lineHeight: 1.4
+                    }}
+                  >
+                    Al activarlo, el cliente conserva su histórico, pero queda fuera de gestiones comerciales.
+                  </span>
+                </span>
+
+                <input
+                  type="checkbox"
+                  checked={noGestionar}
+                  onChange={event => {
+                    const checked = event.target.checked
+                    setNoGestionar(checked)
+                    setNoGestionarError('')
+                    setNoGestionarMessage('')
+                    if (!checked) {
+                      setMotivoNoGestionar('')
+                      setComentarioNoGestionar('')
+                    }
+                  }}
+                  style={{ display: 'none' }}
+                />
+
+                <span
+                  style={{
+                    width: '50px',
+                    height: '28px',
+                    borderRadius: '999px',
+                    background: noGestionar ? '#2563eb' : '#cbd5e1',
+                    position: 'relative',
+                    flex: '0 0 auto',
+                    transition: 'all 160ms ease'
+                  }}
+                >
+                  <span
+                    style={{
+                      position: 'absolute',
+                      top: '4px',
+                      left: noGestionar ? '26px' : '4px',
+                      width: '20px',
+                      height: '20px',
+                      borderRadius: '999px',
+                      background: '#ffffff',
+                      boxShadow: '0 2px 6px rgba(15, 23, 42, 0.25)',
+                      transition: 'all 160ms ease'
+                    }}
+                  />
+                </span>
+              </label>
+
+              {noGestionar && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                    gap: '12px',
+                    marginTop: '14px'
+                  }}
+                >
+                  <label>
+                    <span style={modalStyles.label}>Motivo obligatorio</span>
+                    <select
+                      value={motivoNoGestionar}
+                      onChange={event => {
+                        setMotivoNoGestionar(event.target.value)
+                        setNoGestionarError('')
+                        setNoGestionarMessage('')
+                      }}
+                    >
+                      <option value="">Seleccionar motivo</option>
+                      <option value="Fallecido">Fallecido</option>
+                      <option value="Cambio de médico">Cambio de médico</option>
+                      <option value="Reside fuera del país">Reside fuera del país</option>
+                      <option value="No desea contacto">No desea contacto</option>
+                      <option value="Dato incorrecto / no localizable">Dato incorrecto / no localizable</option>
+                      <option value="Otro">Otro</option>
+                    </select>
+                  </label>
+
+                  <label>
+                    <span style={modalStyles.label}>Comentario interno</span>
+                    <textarea
+                      rows="3"
+                      value={comentarioNoGestionar}
+                      onChange={event => {
+                        setComentarioNoGestionar(event.target.value)
+                        setNoGestionarError('')
+                        setNoGestionarMessage('')
+                      }}
+                      placeholder="Ejemplo: confirmado por familiar, cambio informado por paciente, etc."
+                    />
+                  </label>
+                </div>
+              )}
+
+              {noGestionar && (
+                <div
+                  style={{
+                    marginTop: '12px',
+                    padding: '11px 12px',
+                    borderRadius: '14px',
+                    background: '#fffbeb',
+                    border: '1px solid #fde68a',
+                    color: '#92400e',
+                    fontSize: '13px',
+                    lineHeight: 1.45
+                  }}
+                >
+                  Este cambio conserva el histórico del cliente, pero lo excluye de gestiones comerciales futuras. Puede revertirse desde esta misma ficha.
+                </div>
+              )}
+
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  gap: '10px',
+                  marginTop: '14px'
+                }}
+              >
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={handleGuardarNoGestionar}
+                  disabled={savingNoGestionar || loading}
+                >
+                  {savingNoGestionar
+                    ? 'Guardando...'
+                    : noGestionar
+                      ? 'Guardar como no gestionable'
+                      : 'Guardar como gestionable'}
+                </button>
+
+                {maestro.fecha_inactivo_forzado_manual && (
+                  <span
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      minHeight: '34px',
+                      padding: '7px 11px',
+                      borderRadius: '999px',
+                      background: '#f1f5f9',
+                      color: '#475569',
+                      fontSize: '12px',
+                      fontWeight: 700
+                    }}
+                  >
+                    Última marca: {formatDateTime(maestro.fecha_inactivo_forzado_manual)}
+                    {maestro.usuario_inactivo_forzado_manual ? ` · ${maestro.usuario_inactivo_forzado_manual}` : ''}
+                  </span>
+                )}
+              </div>
+
+              {noGestionarError && <div className="alert error" style={{ marginTop: '12px' }}>{noGestionarError}</div>}
+              {noGestionarMessage && <div className="alert success" style={{ marginTop: '12px' }}>{noGestionarMessage}</div>}
+            </section>
+
+            <section className="card">
+              <div className="section-head">
+                <div>
+                  <h3>Métricas 12 meses</h3>
+                  <p>Ventana móvil oficial para scoring y seguimiento.</p>
+                </div>
+              </div>
+              <div style={modalStyles.grid}>
+                <DetailItem label="Última compra" value={formatDate(estado.ultima_compra)} />
+                <DetailItem label="Días desde última compra" value={estado.dias_desde_ultima_compra ?? '—'} />
+                <DetailItem label="Compras 12m" value={formatNumber(estado.compras_12m)} />
+                <DetailItem label="Total 12m" value={formatMoney(estado.total_12m)} />
+                <DetailItem label="Ticket promedio 12m" value={formatMoney(estado.ticket_promedio_12m)} />
+                <DetailItem label="Frecuencia promedio" value={estado.frecuencia_12m ? `${Number(estado.frecuencia_12m).toFixed(1)} días` : '—'} />
+                <DetailItem label="Score final" value={estado.nota_final ? Number(estado.nota_final).toFixed(2) : '—'} />
+              </div>
+            </section>
+
+            <section className="card">
+              <div className="section-head">
+                <div>
+                  <h3>Histórico secundario</h3>
+                  <p>Referencia histórica, separada del cálculo principal de 12 meses.</p>
+                </div>
+              </div>
+              <div style={modalStyles.grid}>
+                <DetailItem label="Primera compra histórica" value={formatDate(estado.primera_compra)} />
+                <DetailItem label="Última compra histórica" value={formatDate(estado.ultima_compra)} />
+                <DetailItem label="Compras históricas" value={formatNumber(detalle.comprasHistoricas)} />
+                <DetailItem label="Total histórico" value={formatMoney(estado.historico_total)} />
+              </div>
+            </section>
+
+            <section className="card">
+              <div className="section-head">
+                <div>
+                  <h3>Últimas transacciones</h3>
+                  <p>Documentos válidos más recientes del expediente.</p>
+                </div>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Fecha</th>
+                      <th>Empresa / sucursal</th>
+                      <th>Documento</th>
+                      <th>Número</th>
+                      <th>Total</th>
+                      <th>Observaciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {transacciones.map(tx => (
+                      <tr key={`${tx.fecha}-${tx.serie}-${tx.numero_documento}-${tx.total}`}>
+                        <td>{formatDate(tx.fecha)}</td>
+                        <td>{tx.empresa || '—'}</td>
+                        <td>{tx.tipo_documento || '—'} {tx.serie || ''}</td>
+                        <td>{tx.numero_documento || '—'}</td>
+                        <td>{formatMoney(tx.total)}</td>
+                        <td>{tx.observaciones || '—'}</td>
+                      </tr>
+                    ))}
+                    {!transacciones.length && (
+                      <tr>
+                        <td colSpan="6" className="empty">No hay transacciones válidas para mostrar.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </>
+        )}
+      </aside>
+    </div>
+  )
+}
+
+
+function OperationalListsPanel({ lists, counts, activeKey, onSelect, onClear }) {
+  return (
+    <section className="card" style={operationalListStyles.wrapper}>
+      <div className="section-head" style={operationalListStyles.header}>
+        <div>
+          <h2 style={operationalListStyles.title}>Listas operativas</h2>
+          <p style={operationalListStyles.subtitle}>
+            Accesos rápidos para seguimiento comercial. Al seleccionar una lista, se aplica el criterio operativo y se puede exportar directamente.
+          </p>
+        </div>
+
+        {activeKey && (
+          <button type="button" className="secondary" onClick={onClear}>
+            Quitar lista
+          </button>
+        )}
+      </div>
+
+      <div style={operationalListStyles.grid}>
+        {lists.map(list => {
+          const active = activeKey === list.key
+          const total = counts?.[list.key] || 0
+
+          return (
+            <button
+              key={list.key}
+              type="button"
+              onClick={() => onSelect(list.key)}
+              style={{
+                ...operationalListStyles.card,
+                ...(active ? operationalListStyles.cardActive : {})
+              }}
+            >
+              <div style={operationalListStyles.cardTop}>
+                <span style={operationalListStyles.cardTitle}>{list.title}</span>
+                <span style={{
+                  ...operationalListStyles.counter,
+                  ...(active ? operationalListStyles.counterActive : {})
+                }}>
+                  {formatNumber(total)}
+                </span>
+              </div>
+
+              <p style={operationalListStyles.description}>{list.description}</p>
+
+              <div style={operationalListStyles.actionLine}>
+                <span style={operationalListStyles.actionLabel}>Acción</span>
+                <span style={operationalListStyles.actionText}>{list.action}</span>
+              </div>
+            </button>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
+const operationalListStyles = {
+  wrapper: {
+    marginBottom: 16
+  },
+  header: {
+    alignItems: 'flex-start',
+    gap: 16
+  },
+  title: {
+    marginBottom: 6
+  },
+  subtitle: {
+    margin: 0,
+    maxWidth: 760
+  },
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+    gap: 12
+  },
+  card: {
+    border: '1px solid rgba(15, 23, 42, 0.12)',
+    borderRadius: 16,
+    background: '#fff',
+    padding: 16,
+    textAlign: 'left',
+    cursor: 'pointer',
+    boxShadow: '0 8px 22px rgba(15, 23, 42, 0.06)',
+    transition: 'transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease'
+  },
+  cardActive: {
+    borderColor: '#2563eb',
+    boxShadow: '0 12px 30px rgba(37, 99, 235, 0.16)',
+    transform: 'translateY(-1px)'
+  },
+  cardTop: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 8
+  },
+  cardTitle: {
+    fontWeight: 800,
+    color: '#0f172a',
+    fontSize: 15
+  },
+  counter: {
+    minWidth: 44,
+    textAlign: 'center',
+    borderRadius: 999,
+    padding: '5px 10px',
+    background: '#f1f5f9',
+    color: '#0f172a',
+    fontWeight: 800,
+    fontSize: 13
+  },
+  counterActive: {
+    background: '#dbeafe',
+    color: '#1d4ed8'
+  },
+  description: {
+    minHeight: 42,
+    margin: '0 0 12px',
+    color: '#64748b',
+    fontSize: 13,
+    lineHeight: 1.35
+  },
+  actionLine: {
+    borderTop: '1px solid #e2e8f0',
+    paddingTop: 10,
+    display: 'grid',
+    gap: 2
+  },
+  actionLabel: {
+    color: '#94a3b8',
+    fontSize: 11,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    fontWeight: 800
+  },
+  actionText: {
+    color: '#334155',
+    fontSize: 13,
+    fontWeight: 700
+  }
 }
 
 function Filters({ filters, updateFilter, tipoOptions, estadoOptions, clasificacionOptions }) {
@@ -1208,7 +2223,7 @@ function StrategyMosaic({ rows, total }) {
   )
 }
 
-function ClientesTable({ rows, page, totalPages, setPage, totalRows, exportFilteredClientes }) {
+function ClientesTable({ rows, page, totalPages, setPage, totalRows, exportFilteredClientes, onOpenClienteDetalle }) {
   return (
     <section className="card">
       <div className="section-head">
@@ -1236,6 +2251,7 @@ function ClientesTable({ rows, page, totalPages, setPage, totalRows, exportFilte
               <th>Clasificación</th>
               <th>Total 12m</th>
               <th>Acción sugerida</th>
+              <th>Detalle</th>
             </tr>
           </thead>
           <tbody>
@@ -1251,11 +2267,12 @@ function ClientesTable({ rows, page, totalPages, setPage, totalRows, exportFilte
                 <td><Badge value={row.etiqueta_visible || humanLabel(row.clasificacion_estrategica)} type="clasificacion" rawKey={row.clasificacion_estrategica} /></td>
                 <td>{formatMoney(row.total_comprado_12m)}</td>
                 <td>{row.accion_sugerida || '—'}</td>
+                <td><button className="secondary" onClick={() => onOpenClienteDetalle(row.expediente)}>Ver</button></td>
               </tr>
             ))}
             {!rows.length && (
               <tr>
-                <td colSpan="10" className="empty">No hay registros para los filtros seleccionados.</td>
+                <td colSpan="11" className="empty">No hay registros para los filtros seleccionados.</td>
               </tr>
             )}
           </tbody>
