@@ -746,6 +746,26 @@ export default function App() {
     if (loadError) throw loadError
   }
 
+  async function refreshClientesCacheAfterLoad() {
+    try {
+      const { data, error: cacheError } = await supabase.rpc('refrescar_cache_clientes')
+
+      if (cacheError) throw cacheError
+
+      return {
+        ok: true,
+        data
+      }
+    } catch (cacheError) {
+      console.warn('No se pudo refrescar la cache de clientes:', cacheError.message || cacheError)
+
+      return {
+        ok: false,
+        error: cacheError.message || 'No se pudo refrescar la cache de clientes.'
+      }
+    }
+  }
+
   async function handleClientesFile(file) {
     if (!file) return
     setLoading(true)
@@ -811,7 +831,9 @@ export default function App() {
         resumen_json: { updated, invalidRows, emptyRows }
       })
 
-      setMessage(`Maestro cargado correctamente: ${formatNumber(updated)} clientes actualizados, ${formatNumber(invalidRows)} inválidos, ${formatNumber(emptyRows)} filas vacías ignoradas.`)
+      const cacheResult = await refreshClientesCacheAfterLoad()
+
+      setMessage(`Maestro cargado correctamente: ${formatNumber(updated)} clientes actualizados, ${formatNumber(invalidRows)} inválidos, ${formatNumber(emptyRows)} filas vacías ignoradas. ${cacheResult.ok ? 'Cache actualizada.' : 'Carga guardada, pero no se pudo actualizar la cache automáticamente.'}`)
       await loadInitialData()
     } catch (uploadError) {
       setError(uploadError.message || 'Error cargando maestro de clientes.')
@@ -981,7 +1003,9 @@ export default function App() {
         resumen_json: { inserted, duplicated, duplicatedInFile, invalidRows, failed, ignoredRows }
       })
 
-      setMessage(`Transacciones procesadas: ${formatNumber(inserted)} nuevas, ${formatNumber(duplicated)} duplicadas, ${formatNumber(invalidRows + failed)} inválidas, ${formatNumber(ignoredRows)} ignoradas.`)
+      const cacheResult = await refreshClientesCacheAfterLoad()
+
+      setMessage(`Transacciones procesadas: ${formatNumber(inserted)} nuevas, ${formatNumber(duplicated)} duplicadas, ${formatNumber(invalidRows + failed)} inválidas, ${formatNumber(ignoredRows)} ignoradas. ${cacheResult.ok ? 'Cache actualizada.' : 'Carga guardada, pero no se pudo actualizar la cache automáticamente.'}`)
       await loadInitialData()
     } catch (uploadError) {
       setError(uploadError.message || 'Error cargando transacciones.')
