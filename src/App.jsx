@@ -21,6 +21,7 @@ const DEFAULT_FILTERS = {
 
 const TABS = [
   { key: 'dashboard', label: 'Dashboard' },
+  { key: 'oportunidades', label: 'Oportunidades' },
   { key: 'clientes', label: 'Clientes' },
   { key: 'comparativo', label: 'Comparativo anual' },
   { key: 'exportar', label: 'Exportar' },
@@ -48,6 +49,31 @@ const STRATEGY_ORDER = {
   oro: 3,
   diamante: 4
 }
+
+const OFFICIAL_RELATION_STATES = [
+  'nuevo_reciente',
+  'nuevo_en_seguimiento',
+  'nuevo_sin_recompra',
+  'activo',
+  'vigilancia',
+  'en_riesgo',
+  'inactivo_reciente',
+  'inactivo_prolongado',
+  'recuperado',
+  'inactivo_forzado'
+]
+
+const OFFICIAL_STRATEGIES = [
+  { key: 'bronce', name: 'Bronce', label: 'En desarrollo' },
+  { key: 'plata', name: 'Plata', label: 'En consolidación' },
+  { key: 'oro', name: 'Oro', label: 'Fiel' },
+  { key: 'diamante', name: 'Diamante', label: 'Embajador' }
+]
+
+const VALUE_CLASSIFICATIONS = ['plata', 'oro', 'diamante']
+const PRIORITY_CLASSIFICATIONS = ['plata', 'oro']
+const RISK_RELATION_STATES = ['vigilancia', 'en_riesgo', 'inactivo_reciente']
+const DETERIORATION_STATES = ['en_riesgo', 'inactivo_reciente']
 
 const OPERATIONAL_LISTS = [
   {
@@ -267,6 +293,22 @@ function formatDate(value) {
     month: 'short',
     year: 'numeric'
   }).format(date)
+}
+
+function daysSinceDate(value) {
+  if (!value) return null
+  const date = new Date(`${String(value).slice(0, 10)}T12:00:00`)
+  if (Number.isNaN(date.getTime())) return null
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0)
+  return Math.max(0, Math.floor((today.getTime() - date.getTime()) / 86400000))
+}
+
+function opportunityScore(row) {
+  const total = Number(row.total_comprado_12m || 0)
+  const ticket = Number(row.ticket_promedio_12m || 0)
+  const compras = Number(row.compras_12m || 0)
+  return total + ticket * 2 + compras * 15
 }
 
 function formatDateTime(value) {
@@ -1070,38 +1112,157 @@ export default function App() {
   const kpis = useMemo(() => {
     const total = filteredClientes.length
     const conCompra = filteredClientes.filter(row => row.ultima_compra).length
-    const riesgo = filteredClientes.filter(row => ['vigilancia', 'en_riesgo', 'inactivo_reciente'].includes(row.estado_relacion)).length
+    const activos = filteredClientes.filter(row => row.estado_relacion === 'activo').length
+    const vigilancia = filteredClientes.filter(row => row.estado_relacion === 'vigilancia').length
+    const enRiesgo = filteredClientes.filter(row => row.estado_relacion === 'en_riesgo').length
     const nuevosSinRecompra = filteredClientes.filter(row => row.estado_relacion === 'nuevo_sin_recompra').length
+    const inactivosRecientes = filteredClientes.filter(row => row.estado_relacion === 'inactivo_reciente').length
+    const inactivosForzados = filteredClientes.filter(row => row.estado_relacion === 'inactivo_forzado').length
+    const riesgo = vigilancia + enRiesgo + inactivosRecientes
     const embajadores = filteredClientes.filter(row => row.clasificacion_estrategica === 'diamante').length
     const total12m = filteredClientes.reduce((sum, row) => sum + Number(row.total_comprado_12m || 0), 0)
-    return { total, conCompra, riesgo, nuevosSinRecompra, embajadores, total12m }
+
+    return {
+      total,
+      conCompra,
+      activos,
+      vigilancia,
+      enRiesgo,
+      nuevosSinRecompra,
+      inactivosRecientes,
+      inactivosForzados,
+      riesgo,
+      embajadores,
+      total12m
+    }
   }, [filteredClientes])
 
   const estadoDistribution = useMemo(() => {
     const counts = {}
+
     filteredClientes.forEach(row => {
       const key = row.estado_relacion || 'sin_estado'
       counts[key] = (counts[key] || 0) + 1
     })
-    return Object.entries(counts)
+
+    const officialRows = OFFICIAL_RELATION_STATES.map(key => ({
+      key,
+      label: humanLabel(key),
+      value: counts[key] || 0
+    }))
+
+    const extraRows = Object.entries(counts)
+      .filter(([key]) => !OFFICIAL_RELATION_STATES.includes(key))
       .map(([key, value]) => ({ key, label: humanLabel(key), value }))
       .sort((a, b) => (RELATION_ORDER[a.key] || 99) - (RELATION_ORDER[b.key] || 99))
+
+    return [...officialRows, ...extraRows]
   }, [filteredClientes])
 
   const clasificacionDistribution = useMemo(() => {
-    const visibleByKey = new Map()
     const counts = {}
 
     filteredClientes.forEach(row => {
       const key = row.clasificacion_estrategica || 'sin_clasificacion'
       counts[key] = (counts[key] || 0) + 1
-      visibleByKey.set(key, row.etiqueta_visible || humanLabel(key))
     })
 
-    return Object.entries(counts)
-      .map(([key, value]) => ({ key, label: visibleByKey.get(key), value }))
+    const officialRows = OFFICIAL_STRATEGIES.map(strategy => ({
+      key: strategy.key,
+      name: strategy.name,
+      label: strategy.label,
+      value: counts[strategy.key] || 0
+    }))
+
+    const extraRows = Object.entries(counts)
+      .filter(([key]) => !OFFICIAL_STRATEGIES.some(strategy => strategy.key === key))
+      .map(([key, value]) => ({ key, name: humanLabel(key), label: humanLabel(key), value }))
       .sort((a, b) => (STRATEGY_ORDER[a.key] || 99) - (STRATEGY_ORDER[b.key] || 99))
+
+    return [...officialRows, ...extraRows]
   }, [filteredClientes])
+
+  const clientesPrioritarios = useMemo(() => {
+    return filteredClientes
+      .filter(row => ['plata', 'oro'].includes(row.clasificacion_estrategica))
+      .filter(row => ['vigilancia', 'en_riesgo', 'inactivo_reciente'].includes(row.estado_relacion))
+      .sort((a, b) => Number(b.total_comprado_12m || 0) - Number(a.total_comprado_12m || 0))
+      .slice(0, 10)
+  }, [filteredClientes])
+
+  const oportunidadesValorRecuperable = useMemo(() => {
+    return filteredClientes
+      .filter(row => VALUE_CLASSIFICATIONS.includes(row.clasificacion_estrategica))
+      .filter(row => RISK_RELATION_STATES.includes(row.estado_relacion))
+      .filter(row => row.estado_relacion !== 'inactivo_forzado')
+      .sort((a, b) => opportunityScore(b) - opportunityScore(a))
+      .slice(0, 15)
+  }, [filteredClientes])
+
+  const clientesAltoTicketDeterioro = useMemo(() => {
+    return filteredClientes
+      .filter(row => RISK_RELATION_STATES.includes(row.estado_relacion))
+      .filter(row => Number(row.ticket_promedio_12m || 0) >= 100)
+      .sort((a, b) => Number(b.ticket_promedio_12m || 0) - Number(a.ticket_promedio_12m || 0))
+      .slice(0, 10)
+  }, [filteredClientes])
+
+  const nuevosSinRecompraBuckets = useMemo(() => {
+    const buckets = [
+      { key: '0_30', label: '0–30 días', min: 0, max: 30, count: 0, total: 0 },
+      { key: '31_60', label: '31–60 días', min: 31, max: 60, count: 0, total: 0 },
+      { key: '61_90', label: '61–90 días', min: 61, max: 90, count: 0, total: 0 },
+      { key: '90_mas', label: '90+ días', min: 91, max: Infinity, count: 0, total: 0 }
+    ]
+
+    filteredClientes
+      .filter(row => row.estado_relacion === 'nuevo_sin_recompra')
+      .forEach(row => {
+        const age = daysSinceDate(row.primera_compra || row.ultima_compra)
+        const bucket = buckets.find(item => age !== null && age >= item.min && age <= item.max) || buckets[buckets.length - 1]
+        bucket.count += 1
+        bucket.total += Number(row.total_comprado_12m || 0)
+      })
+
+    return buckets
+  }, [filteredClientes])
+
+  const riesgoPorSucursal = useMemo(() => {
+    const groups = new Map()
+
+    filteredClientes
+      .filter(row => RISK_RELATION_STATES.includes(row.estado_relacion))
+      .forEach(row => {
+        const key = row.sucursal_empresa || 'Sin sucursal / empresa'
+        const current = groups.get(key) || { key, sucursal: key, clientes: 0, total12m: 0 }
+        current.clientes += 1
+        current.total12m += Number(row.total_comprado_12m || 0)
+        groups.set(key, current)
+      })
+
+    return [...groups.values()]
+      .sort((a, b) => b.clientes - a.clientes || b.total12m - a.total12m)
+      .slice(0, 8)
+  }, [filteredClientes])
+
+  const concentracionIngresos = useMemo(() => {
+    const total = filteredClientes.reduce((sum, row) => sum + Number(row.total_comprado_12m || 0), 0)
+
+    return OFFICIAL_STRATEGIES.map(strategy => {
+      const value = filteredClientes
+        .filter(row => row.clasificacion_estrategica === strategy.key)
+        .reduce((sum, row) => sum + Number(row.total_comprado_12m || 0), 0)
+
+      return {
+        key: strategy.key,
+        name: strategy.name,
+        label: strategy.label,
+        value,
+        pct: total ? (value / total) * 100 : 0
+      }
+    })
+  }, [filteredClientes])
+
 
   const comparativoKpis = useMemo(() => {
     const nuevos = filteredComparativo.reduce((sum, row) => sum + Number(row.pacientes_nuevos || 0), 0)
@@ -1127,6 +1288,19 @@ export default function App() {
       estado: 'todos',
       clasificacion: 'todos'
     }))
+  }
+
+  function openOperationalList(key) {
+    setActiveOperationalList(key)
+    setFilters(current => ({
+      ...current,
+      search: '',
+      tipoCliente: 'todos',
+      estado: 'todos',
+      clasificacion: 'todos'
+    }))
+    setPage(1)
+    setActiveTab('exportar')
   }
 
   function clearOperationalList() {
@@ -1231,7 +1405,7 @@ export default function App() {
         {message && <div className="alert success">{message}</div>}
         {loading && <div className="alert info">Procesando / actualizando datos...</div>}
 
-        {['dashboard', 'clientes', 'exportar'].includes(activeTab) && (
+        {['dashboard', 'oportunidades', 'clientes', 'exportar'].includes(activeTab) && (
           <Filters
             filters={filters}
             updateFilter={updateFilter}
@@ -1244,29 +1418,60 @@ export default function App() {
         {activeTab === 'dashboard' && (
           <>
             <section className="kpi-grid">
-              <KpiCard title="Clientes filtrados" value={formatNumber(kpis.total)} helper="Base operativa según filtros." />
-              <KpiCard title="Con compra histórica" value={formatNumber(kpis.conCompra)} helper="Clientes con al menos una transacción válida." />
-              <KpiCard title="Riesgo operativo" value={formatNumber(kpis.riesgo)} helper="Vigilancia, en riesgo o inactivo reciente." tone="warning" />
-              <KpiCard title="Nuevos sin recompra" value={formatNumber(kpis.nuevosSinRecompra)} helper="Primera compra reciente sin recompra." tone="danger" />
-              <KpiCard title="Embajadores" value={formatNumber(kpis.embajadores)} helper="Clientes Diamante según score." tone="success" />
+              <KpiCard title="Clientes operativos" value={formatNumber(kpis.total)} helper="Base operativa según filtros activos." />
+              <KpiCard title="Activos" value={formatNumber(kpis.activos)} helper="Clientes con relación comercial saludable." tone="success" />
+              <KpiCard title="Vigilancia" value={formatNumber(kpis.vigilancia)} helper="Seguimiento preventivo antes de riesgo." tone="warning" />
+              <KpiCard title="En riesgo" value={formatNumber(kpis.enRiesgo)} helper="Clientes que requieren recuperación." tone="danger" />
+              <KpiCard title="Nuevos sin recompra" value={formatNumber(kpis.nuevosSinRecompra)} helper="Prioridad para segunda compra." tone="danger" />
+              <KpiCard title="Inactivos recientes" value={formatNumber(kpis.inactivosRecientes)} helper="Base recuperable de corto plazo." tone="warning" />
+              <KpiCard title="No gestionar" value={formatNumber(kpis.inactivosForzados)} helper="Inactivos forzados / exclusión comercial." />
               <KpiCard title="Total 12 meses" value={formatMoney(kpis.total12m)} helper="Compras dentro de ventana móvil 12m." tone="primary" />
             </section>
 
             <section className="dashboard-grid">
-              <DistributionCard title="Estado de relación" subtitle="Distribución relativa sobre clientes filtrados." rows={estadoDistribution} total={filteredClientes.length} type="estado" />
               <StrategyMosaic rows={clasificacionDistribution} total={filteredClientes.length} />
+              <DistributionCard title="Estado de relación" subtitle="Separado del valor estratégico. Se calcula con recencia, recuperación e inactividad." rows={estadoDistribution} total={filteredClientes.length} type="estado" />
             </section>
 
-            <ClientesTable
-              rows={paginatedClientes}
-              page={page}
-              totalPages={totalPages}
-              setPage={setPage}
-              totalRows={filteredClientes.length}
-              exportFilteredClientes={exportFilteredClientes}
+            <OperationalListsPanel
+              lists={OPERATIONAL_LISTS}
+              counts={operationalListCounts}
+              activeKey={activeOperationalList}
+              onSelect={selectOperationalList}
+              onClear={clearOperationalList}
+            />
+
+            {activeOperationalListDef && (
+              <div className="alert info" style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span>
+                  Lista activa en Dashboard: <strong>{activeOperationalListDef.title}</strong>. Para revisar todos los registros o descargarla, abre Exportar.
+                </span>
+                <button type="button" className="secondary" onClick={() => setActiveTab('exportar')}>
+                  Ver / exportar lista
+                </button>
+              </div>
+            )}
+
+            <PriorityClientsTable
+              rows={clientesPrioritarios}
+              totalBase={filteredClientes.length}
               onOpenClienteDetalle={openClienteDetalle}
+              onGoClientes={() => setActiveTab('clientes')}
             />
           </>
+        )}
+
+        {activeTab === 'oportunidades' && (
+          <OpportunitiesTab
+            totalBase={filteredClientes.length}
+            oportunidadesValorRecuperable={oportunidadesValorRecuperable}
+            nuevosSinRecompraBuckets={nuevosSinRecompraBuckets}
+            clientesAltoTicketDeterioro={clientesAltoTicketDeterioro}
+            riesgoPorSucursal={riesgoPorSucursal}
+            concentracionIngresos={concentracionIngresos}
+            onOpenClienteDetalle={openClienteDetalle}
+            onOpenOperationalList={openOperationalList}
+          />
         )}
 
         {activeTab === 'clientes' && (
@@ -2192,36 +2397,593 @@ function DistributionCard({ title, subtitle, rows, total, type }) {
 }
 
 function StrategyMosaic({ rows, total }) {
-  const max = Math.max(...rows.map(row => row.value), 1)
-
   return (
     <section className="card">
       <div className="section-head">
         <div>
           <h2>Clasificación estratégica</h2>
-          <p>Mosaico relativo por valor comercial según recencia, frecuencia y ticket.</p>
+          <p>Valor comercial por score estratégico. Se muestran todas las categorías oficiales, incluso si están en cero.</p>
         </div>
       </div>
-      <div className="strategy-mosaic">
+
+      <div style={strategyCardStyles.grid}>
         {rows.map(row => {
-          const strength = Math.max(0.3, Number(row.value || 0) / max)
+          const style = strategyCardStyles.byKey[row.key] || strategyCardStyles.byKey.default
+
           return (
             <article
               key={row.key}
-              className={`mosaic-tile strategy-${slug(row.key)}`}
-              style={{ flexGrow: Math.max(1, row.value), minHeight: `${86 + strength * 80}px` }}
+              className={`strategy-summary-card strategy-${slug(row.key)}`}
+              style={{
+                ...strategyCardStyles.card,
+                borderColor: style.border,
+                background: style.background,
+                boxShadow: `0 14px 30px ${style.shadow}`
+              }}
             >
-              <span>{row.label}</span>
-              <strong>{formatNumber(row.value)}</strong>
-              <small>{percent(row.value, total)}</small>
+              <div style={strategyCardStyles.cardHeader}>
+                <span style={{ ...strategyCardStyles.badge, color: style.border }}>{row.name || humanLabel(row.key)}</span>
+                <span style={{ ...strategyCardStyles.dot, background: style.border }} />
+              </div>
+              <strong style={strategyCardStyles.value}>{formatNumber(row.value)}</strong>
+              <div style={strategyCardStyles.meta}>
+                <span>{row.label}</span>
+                <span>{percent(row.value, total)}</span>
+              </div>
             </article>
           )
         })}
-        {!rows.length && <p className="empty">No hay datos para mostrar.</p>}
       </div>
     </section>
   )
 }
+
+const strategyCardStyles = {
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: 14
+  },
+  card: {
+    border: '1px solid',
+    borderLeftWidth: 6,
+    borderRadius: 18,
+    padding: '16px 16px 14px',
+    minHeight: 142,
+    display: 'flex',
+    flexDirection: 'column',
+    justifyContent: 'space-between'
+  },
+  cardHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 10
+  },
+  badge: {
+    fontWeight: 800,
+    fontSize: 13,
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em'
+  },
+  dot: {
+    width: 12,
+    height: 12,
+    borderRadius: 999
+  },
+  value: {
+    fontSize: 34,
+    lineHeight: 1,
+    marginTop: 14,
+    color: '#111827'
+  },
+  meta: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: 10,
+    marginTop: 12,
+    color: '#64748b',
+    fontSize: 13,
+    fontWeight: 700
+  },
+  byKey: {
+    bronce: {
+      border: '#b7791f',
+      background: 'linear-gradient(135deg, #fff8eb 0%, #ffffff 68%)',
+      shadow: 'rgba(180, 83, 9, 0.10)'
+    },
+    plata: {
+      border: '#94a3b8',
+      background: 'linear-gradient(135deg, #f8fafc 0%, #ffffff 68%)',
+      shadow: 'rgba(100, 116, 139, 0.12)'
+    },
+    oro: {
+      border: '#d97706',
+      background: 'linear-gradient(135deg, #fffbeb 0%, #ffffff 68%)',
+      shadow: 'rgba(217, 119, 6, 0.12)'
+    },
+    diamante: {
+      border: '#7c3aed',
+      background: 'linear-gradient(135deg, #f5f3ff 0%, #eff6ff 55%, #ffffff 100%)',
+      shadow: 'rgba(124, 58, 237, 0.12)'
+    },
+    default: {
+      border: '#64748b',
+      background: 'linear-gradient(135deg, #f8fafc 0%, #ffffff 68%)',
+      shadow: 'rgba(100, 116, 139, 0.10)'
+    }
+  }
+}
+
+
+function OpportunitiesTab({
+  totalBase,
+  oportunidadesValorRecuperable,
+  nuevosSinRecompraBuckets,
+  clientesAltoTicketDeterioro,
+  riesgoPorSucursal,
+  concentracionIngresos,
+  onOpenClienteDetalle,
+  onOpenOperationalList
+}) {
+  const totalValorRecuperable = oportunidadesValorRecuperable.reduce((sum, row) => sum + Number(row.total_comprado_12m || 0), 0)
+  const totalNuevosSinRecompra = nuevosSinRecompraBuckets.reduce((sum, row) => sum + row.count, 0)
+  const altoTicketPromedio = clientesAltoTicketDeterioro.length
+    ? clientesAltoTicketDeterioro.reduce((sum, row) => sum + Number(row.ticket_promedio_12m || 0), 0) / clientesAltoTicketDeterioro.length
+    : 0
+  const sucursalMasRiesgo = riesgoPorSucursal[0]
+
+  return (
+    <>
+      <section style={opportunityStyles.hero}>
+        <div>
+          <p style={opportunityStyles.eyebrow}>Análisis estratégico</p>
+          <h2 style={opportunityStyles.title}>Oportunidades comerciales y deterioro de cartera</h2>
+          <p style={opportunityStyles.copy}>
+            Esta vista usa los filtros globales activos y prioriza clientes donde hay mayor valor recuperable,
+            riesgo comercial o falta de segunda compra. La operación detallada y las listas completas siguen en Clientes y Exportar.
+          </p>
+        </div>
+      </section>
+
+      <section className="kpi-grid">
+        <KpiCard
+          title="Oportunidades priorizadas"
+          value={formatNumber(oportunidadesValorRecuperable.length)}
+          helper={`Valor 12m asociado: ${formatMoney(totalValorRecuperable)}`}
+          tone="primary"
+        />
+        <KpiCard
+          title="Nuevos sin recompra"
+          value={formatNumber(totalNuevosSinRecompra)}
+          helper="Segmentados por antigüedad desde primera compra."
+          tone="danger"
+        />
+        <KpiCard
+          title="Alto ticket en deterioro"
+          value={formatNumber(clientesAltoTicketDeterioro.length)}
+          helper={`Ticket promedio del grupo: ${formatMoney(altoTicketPromedio)}`}
+          tone="warning"
+        />
+        <KpiCard
+          title="Sucursal con más riesgo"
+          value={sucursalMasRiesgo ? formatNumber(sucursalMasRiesgo.clientes) : '0'}
+          helper={sucursalMasRiesgo ? sucursalMasRiesgo.sucursal : 'Sin clientes en riesgo con filtros activos.'}
+          tone="neutral"
+        />
+      </section>
+
+      <section style={opportunityStyles.grid}>
+        <section className="card" style={opportunityStyles.cardWide}>
+          <div className="section-head">
+            <div>
+              <h2>Top oportunidades por valor recuperable</h2>
+              <p>Clientes Plata, Oro o Diamante en vigilancia, riesgo o inactividad reciente.</p>
+            </div>
+            <button type="button" className="secondary" onClick={() => onOpenOperationalList('inactivos_recientes_recuperables')}>
+              Exportar recuperables
+            </button>
+          </div>
+
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Expediente</th>
+                  <th>Nombre</th>
+                  <th>Clasificación</th>
+                  <th>Estado</th>
+                  <th>Última compra</th>
+                  <th>Total 12m</th>
+                  <th>Ticket</th>
+                  <th>Acción</th>
+                </tr>
+              </thead>
+              <tbody>
+                {oportunidadesValorRecuperable.map(row => (
+                  <tr key={row.expediente}>
+                    <td>{row.expediente}</td>
+                    <td>{row.nombre}</td>
+                    <td><Badge value={row.etiqueta_visible || row.clasificacion_estrategica} type="clasificacion" rawKey={row.clasificacion_estrategica} /></td>
+                    <td><Badge value={row.estado_relacion} type="estado" /></td>
+                    <td>{formatDate(row.ultima_compra)}</td>
+                    <td>{formatMoney(row.total_comprado_12m)}</td>
+                    <td>{formatMoney(row.ticket_promedio_12m)}</td>
+                    <td>
+                      <button type="button" className="secondary" onClick={() => onOpenClienteDetalle(row.expediente)}>
+                        Ver ficha
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {!oportunidadesValorRecuperable.length && (
+                  <tr>
+                    <td colSpan="8" className="empty">No hay oportunidades para los filtros seleccionados.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="section-head">
+            <div>
+              <h2>Nuevos sin recompra por antigüedad</h2>
+              <p>Permite priorizar la segunda compra según tiempo transcurrido.</p>
+            </div>
+          </div>
+
+          <div style={opportunityStyles.bucketList}>
+            {nuevosSinRecompraBuckets.map(bucket => (
+              <div key={bucket.key} style={opportunityStyles.bucketItem}>
+                <div style={opportunityStyles.bucketText}>
+                  <strong style={opportunityStyles.itemTitle}>{bucket.label}</strong>
+                  <span style={opportunityStyles.itemMeta}>{formatMoney(bucket.total)} en compras 12m</span>
+                </div>
+                <b style={opportunityStyles.countPill}>{formatNumber(bucket.count)}</b>
+              </div>
+            ))}
+          </div>
+
+          <button type="button" className="secondary" onClick={() => onOpenOperationalList('nuevos_sin_recompra')}>
+            Ver lista completa
+          </button>
+        </section>
+
+        <section className="card">
+          <div className="section-head">
+            <div>
+              <h2>Concentración de ingresos 12m</h2>
+              <p>Participación por clasificación estratégica.</p>
+            </div>
+          </div>
+
+          <div style={opportunityStyles.concentrationList}>
+            {concentracionIngresos.map(row => (
+              <div key={row.key} style={opportunityStyles.concentrationItem}>
+                <div style={opportunityStyles.concentrationText}>
+                  <strong style={opportunityStyles.itemTitle}>{row.name}</strong>
+                  <span style={opportunityStyles.itemMeta}>{row.label}</span>
+                </div>
+                <div style={opportunityStyles.concentrationValue}>
+                  <b style={opportunityStyles.moneyValue}>{formatMoney(row.value)}</b>
+                  <span style={opportunityStyles.percentValue}>{row.pct.toFixed(1)}%</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="section-head">
+            <div>
+              <h2>Alto ticket en deterioro</h2>
+              <p>Clientes con ticket promedio alto y señales de pérdida de relación.</p>
+            </div>
+          </div>
+
+          <div style={opportunityStyles.compactList}>
+            {clientesAltoTicketDeterioro.map(row => (
+              <button
+                type="button"
+                key={row.expediente}
+                style={opportunityStyles.compactItem}
+                onClick={() => onOpenClienteDetalle(row.expediente)}
+              >
+                <span style={opportunityStyles.compactText}>
+                  <strong style={opportunityStyles.compactName}>{row.nombre}</strong>
+                  <small style={opportunityStyles.compactMeta}>{row.expediente} · {humanLabel(row.estado_relacion)}</small>
+                </span>
+                <b style={opportunityStyles.compactAmount}>{formatMoney(row.ticket_promedio_12m)}</b>
+              </button>
+            ))}
+            {!clientesAltoTicketDeterioro.length && (
+              <p className="empty">No hay clientes de alto ticket en deterioro para los filtros seleccionados.</p>
+            )}
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="section-head">
+            <div>
+              <h2>Riesgo por sucursal / empresa</h2>
+              <p>Clientes en vigilancia, riesgo o inactividad reciente agrupados por origen.</p>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Sucursal / empresa</th>
+                  <th>Clientes</th>
+                  <th>Total 12m</th>
+                </tr>
+              </thead>
+              <tbody>
+                {riesgoPorSucursal.map(row => (
+                  <tr key={row.key}>
+                    <td>{row.sucursal}</td>
+                    <td>{formatNumber(row.clientes)}</td>
+                    <td>{formatMoney(row.total12m)}</td>
+                  </tr>
+                ))}
+                {!riesgoPorSucursal.length && (
+                  <tr>
+                    <td colSpan="3" className="empty">No hay riesgo por sucursal con los filtros seleccionados.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card" style={opportunityStyles.cardNotice}>
+          <div className="section-head">
+            <div>
+              <h2>Evolución vs snapshot anterior</h2>
+              <p>Queda preparado como siguiente mejora cuando exista más de un snapshot comparable.</p>
+            </div>
+          </div>
+          <p style={opportunityStyles.copy}>
+            Ya existe la tabla de snapshots. Para activar este bloque con métricas reales necesitamos al menos dos cortes
+            comparables y una consulta agregada de cambios de estado.
+          </p>
+        </section>
+      </section>
+    </>
+  )
+}
+
+const opportunityStyles = {
+  hero: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: 18,
+    alignItems: 'flex-start',
+    padding: 22,
+    borderRadius: 20,
+    border: '1px solid rgba(15, 23, 42, 0.10)',
+    background: 'linear-gradient(135deg, #f8fbff 0%, #eef6ff 100%)',
+    marginBottom: 18
+  },
+  eyebrow: {
+    margin: '0 0 6px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.08em',
+    fontSize: 12,
+    fontWeight: 800,
+    color: '#2563eb'
+  },
+  title: {
+    margin: 0,
+    fontSize: 24,
+    color: '#0f172a'
+  },
+  copy: {
+    margin: '8px 0 0',
+    color: '#475569',
+    lineHeight: 1.55
+  },
+  heroActions: {
+    display: 'flex',
+    gap: 10,
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end'
+  },
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+    gap: 16
+  },
+  cardWide: {
+    gridColumn: '1 / -1'
+  },
+  bucketList: {
+    display: 'grid',
+    gap: 10,
+    marginBottom: 14
+  },
+  bucketItem: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: 14,
+    alignItems: 'flex-start',
+    padding: '14px 16px',
+    borderRadius: 14,
+    background: '#f8fafc',
+    border: '1px solid rgba(15, 23, 42, 0.08)'
+  },
+  bucketText: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 4,
+    minWidth: 0
+  },
+  itemTitle: {
+    display: 'block',
+    lineHeight: 1.25,
+    color: '#0f172a'
+  },
+  itemMeta: {
+    display: 'block',
+    color: '#475569',
+    fontSize: 13,
+    lineHeight: 1.35
+  },
+  countPill: {
+    flex: '0 0 auto',
+    minWidth: 36,
+    textAlign: 'right',
+    color: '#0f172a'
+  },
+  concentrationList: {
+    display: 'grid',
+    gap: 10
+  },
+  concentrationItem: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 16,
+    padding: '13px 0',
+    borderBottom: '1px solid rgba(15, 23, 42, 0.08)'
+  },
+  concentrationText: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 3,
+    minWidth: 0
+  },
+  concentrationValue: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-end',
+    gap: 3,
+    minWidth: 110,
+    textAlign: 'right'
+  },
+  moneyValue: {
+    display: 'block',
+    whiteSpace: 'nowrap',
+    color: '#0f172a'
+  },
+  percentValue: {
+    display: 'block',
+    color: '#475569',
+    fontSize: 13,
+    lineHeight: 1.25
+  },
+  compactList: {
+    display: 'grid',
+    gap: 10
+  },
+  compactItem: {
+    width: '100%',
+    border: '1px solid rgba(15, 23, 42, 0.10)',
+    background: '#fff',
+    borderRadius: 14,
+    padding: '13px 14px',
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 14,
+    textAlign: 'left',
+    cursor: 'pointer'
+  },
+  compactText: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 4,
+    minWidth: 0
+  },
+  compactName: {
+    display: 'block',
+    lineHeight: 1.25,
+    color: '#0f172a'
+  },
+  compactMeta: {
+    display: 'block',
+    color: '#475569',
+    fontSize: 12,
+    lineHeight: 1.35
+  },
+  compactAmount: {
+    flex: '0 0 auto',
+    whiteSpace: 'nowrap',
+    color: '#0f172a'
+  },
+  cardNotice: {
+    borderStyle: 'dashed'
+  }
+}
+
+
+function PriorityClientsTable({ rows, totalBase, onOpenClienteDetalle, onGoClientes }) {
+  return (
+    <section className="card">
+      <div className="section-head">
+        <div>
+          <h2>Clientes prioritarios para seguimiento</h2>
+          <p>
+            Top 10 de clientes Plata u Oro en vigilancia, riesgo o inactividad reciente,
+            ordenados por mayor total comprado en la ventana móvil de 12 meses.
+          </p>
+        </div>
+        <button type="button" className="secondary" onClick={onGoClientes}>
+          Ver todos en Clientes
+        </button>
+      </div>
+
+      <div className="table-summary">
+        <span>{formatNumber(rows.length)} prioridades mostradas</span>
+        <span>Base filtrada: {formatNumber(totalBase)} clientes</span>
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Expediente</th>
+              <th>Nombre</th>
+              <th>Clasificación</th>
+              <th>Estado</th>
+              <th>Última compra</th>
+              <th>Total 12m</th>
+              <th>Acción sugerida</th>
+              <th>Detalle</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(row => (
+              <tr key={row.expediente}>
+                <td>{row.expediente}</td>
+                <td>{row.nombre}</td>
+                <td><Badge value={row.etiqueta_visible || humanLabel(row.clasificacion_estrategica)} type="clasificacion" rawKey={row.clasificacion_estrategica} /></td>
+                <td><Badge value={humanLabel(row.estado_relacion)} type="estado" rawKey={row.estado_relacion} /></td>
+                <td>{formatDate(row.ultima_compra)}</td>
+                <td>{formatMoney(row.total_comprado_12m)}</td>
+                <td>{row.accion_sugerida || '—'}</td>
+                <td>
+                  <button type="button" className="secondary small" onClick={() => onOpenClienteDetalle(row.expediente)}>
+                    Ver
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {!rows.length && (
+              <tr>
+                <td colSpan="8" className="empty">No hay clientes prioritarios para los filtros activos.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
 
 function ClientesTable({ rows, page, totalPages, setPage, totalRows, exportFilteredClientes, onOpenClienteDetalle }) {
   return (
