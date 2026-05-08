@@ -2974,7 +2974,21 @@ function PriorityClientsTable({ rows, totalBase, onOpenClienteDetalle, onGoClien
             ))}
             {!rows.length && (
               <tr>
-                <td colSpan="8" className="empty">No hay clientes prioritarios para los filtros activos.</td>
+                <td colSpan="8" className="empty">
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10, padding: '18px 12px' }}>
+                    <strong>No hay clientes prioritarios con los filtros actuales.</strong>
+                    <span style={{ maxWidth: 680, lineHeight: 1.45, color: '#64748b' }}>
+                      {totalBase > 0
+                        ? `La búsqueda contiene ${formatNumber(totalBase)} cliente${totalBase === 1 ? '' : 's'}, pero ninguno cumple el criterio de prioridad: Plata, Oro o Diamante en vigilancia, riesgo o inactividad reciente.`
+                        : 'No hay clientes dentro de los filtros activos.'}
+                    </span>
+                    {totalBase > 0 && (
+                      <button type="button" className="secondary" onClick={onGoClientes}>
+                        Ver resultados en Clientes
+                      </button>
+                    )}
+                  </div>
+                </td>
               </tr>
             )}
           </tbody>
